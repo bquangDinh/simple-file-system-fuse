@@ -1,0 +1,80 @@
+#include <linux/limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+/* Fallback for environments where S_IFDIR is not exposed  */
+#ifndef S_IFDIR
+#define S_IFDIR 0040000
+#endif
+
+#ifndef _MYFS_H_
+#define _MYFS_H_
+
+#define ROOT_INODE 0 // default inode number of root is 0
+#define SUPERBLOCK_BLK_NUM 0
+
+#define MAGIC_NUM 0x1234
+
+// Maximum number of inodes in inode region
+// Each inode occupies one page
+#define MAX_INODE_NUM 1024
+
+// Maximum number of data blocks in data region
+// Each data block occupies one page
+// Beware that the total number of inodes + data + inode bitmap (one page) + data bitmap (one page) + superblock (one page) must be <= the size of file
+#define MAX_DATA_NUM 7165
+
+#define INODE_BITMAP_BYTES ((MAX_INODE_NUM + 7) / 8) // in bytes
+#define DATA_BITMAP_BYTES ((MAX_DATA_NUM + 7) / 8) // in bytes													 									  
+#define DIRECT_PTRS_COUNT 12
+
+struct superblock {
+	uint16_t magic_num;			// magic number used to identify if a storage file is valid
+	uint16_t max_inum; 			// max number of inodes
+	uint16_t max_dnum; 			// max number of data blocks
+	uint32_t i_bitmap_blk; 		// start block of inode bitmap
+	uint32_t d_bitmap_blk; 		// start block of data bitmap
+	uint32_t i_start_blk; 		// start block of inode region					  					  			
+	uint32_t d_start_blk;		// start block of data region
+};
+
+struct inode {
+	uint16_t ino;				// inode number
+	uint16_t valid;				// bit check if inode is valid
+	uint32_t size;				// size of the file
+	uint32_t type;				// type of the file
+	uint32_t nlink;				// link count
+	uint32_t uid;				// user id
+	uint32_t gid;				// group id
+	struct timespec atime;				// last access time
+	struct timespec mtime;				// last modification time
+	struct timespec ctime;				// last modification to inode time
+	int directs[DIRECT_PTRS_COUNT];
+	int indirect_ptr;
+};
+
+struct dirent {
+	uint16_t ino;				// inode number
+	uint16_t valid;				// bit check if directory entry is valid
+	char name[NAME_MAX];		// maximum bytes for file name
+	uint16_t len;				// length of file name actually
+};
+
+/**
+ * bitmap operations
+ */
+typedef unsigned char* bitmap_t;
+
+static inline void set_bitmap(bitmap_t b, int i) {
+	b[i / 8] |= 1 << (i & 7);
+}
+
+static inline void unset_bitmap(bitmap_t b, int i) {
+	b[i / 8] &= ~(1 << (i & 7));
+}
+
+static inline uint8_t get_bitmap(bitmap_t b, int i) {
+	return b[i / 8] & (1 << (i & 7)) ? 1 : 0;
+}
+
+#endif
