@@ -37,7 +37,7 @@ static inline void dump_str(const char*s, size_t len) {
 int get_avail_ino() {
 	assert(superblock != NULL);
 
-	void* bitmap_block = malloc(BLOCK_SIZE);
+	bitmap_t bitmap_block = (bitmap_t)malloc(BLOCK_SIZE);
 	
 	if (block_read(superblock->i_bitmap_blk, bitmap_block) == -1) {
 		perror("Unable to read inode bitmap");
@@ -47,31 +47,23 @@ int get_avail_ino() {
 		return -1;
 	}
 
-	bitmap_t inode_bitmap = (bitmap_t)bitmap_block;
-
 	for (int i = 0; i < superblock->max_inum; ++i) {
-		if (get_bitmap(inode_bitmap, i) == 0) {
-			set_bitmap(inode_bitmap, i);
-
+		if (get_bitmap(bitmap_block, i) == 0) {
+			set_bitmap(bitmap_block, i);
+			
 			if (block_write(superblock->i_bitmap_blk, bitmap_block) == -1) {
 				perror("Failed to write inode bitmap");
 				
-				inode_bitmap = NULL;
-
 				free(bitmap_block);
 
 				return -1;
 			}
-
-			inode_bitmap = NULL;
-
+			
 			free(bitmap_block);
-
+			
 			return i;
 		}
 	}
-
-	inode_bitmap = NULL;
 
 	free(bitmap_block);
 
@@ -84,7 +76,7 @@ int get_avail_ino() {
 int get_avail_blkno() {
 	assert(superblock != NULL);
 
-	void* bitmap_block = malloc(BLOCK_SIZE);
+	bitmap_t bitmap_block = (bitmap_t)malloc(BLOCK_SIZE);
 	
 	if (block_read(superblock->d_bitmap_blk, bitmap_block) == -1) {
 		perror("Unable to read data bitmap block");
@@ -94,32 +86,28 @@ int get_avail_blkno() {
 		return -1;
 	}
 
-	bitmap_t bitmap = (bitmap_t)bitmap_block;
-
 	for (int i = 0; i < superblock->max_dnum; ++i) {
-		if (get_bitmap(bitmap, i) == 0) {
-			set_bitmap(bitmap, i);
+		printf("\tChecking data block [%d]\n", i);
 
+		if (get_bitmap(bitmap_block, i) == 0) {
+			set_bitmap(bitmap_block, i);
+			
 			if (block_write(superblock->d_bitmap_blk, bitmap_block) == -1) {
 				perror("Unable to write data bitmap block");
-
-				bitmap = NULL;
 
 				free(bitmap_block);
 
 				return -1;
 			}
 
-			bitmap = NULL;
-
 			free(bitmap_block);
 
-			return i;
+			return i + superblock->d_start_blk;
 		}
 	}
 
 	free(bitmap_block);
-
+	
 	return -1;
 }
 
@@ -268,7 +256,7 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 	int num_dirents = dir_inode->size / sizeof(struct dirent);
 
 	int next_avail_index = num_dirents % BLOCK_SIZE;
-	
+		
 	struct dirent entry;
 
 	entry.ino = f_ino;
@@ -276,14 +264,14 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 	
 	if (name_len >= NAME_MAX) name_len = NAME_MAX - 1; 
 
-	memcpy(entry.name, fname, name_len);
+	strncpy(entry.name, fname, name_len);
 
 	entry.name[name_len] = '\0';
 
 	entry.len = name_len;
 	
 	struct dirent* entry_table = (struct dirent*)malloc(BLOCK_SIZE);
-
+	
 	if (dir_inode->directs[block_index] == -1) {
 		int next_avail_block = get_avail_blkno();
 
@@ -302,9 +290,12 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 		return -1;
 	}
 
-	entry_table[next_avail_index] = entry;
+	entry_table[next_avail_index].ino = entry.ino;
+	entry_table[next_avail_index].len = entry.len;
+	strncpy(entry_table[next_avail_index].name, entry.name, entry.len);
+	entry_table[next_avail_index].valid = entry.valid;
 
-	if (block_write(dir_inode->directs[block_index], entry_table) == -1) {
+	if (block_write(dir_inode->directs[block_index], (void*)entry_table) == -1) {
 		perror("Unable to write entry table");
 		
 		free(entry_table);
@@ -498,6 +489,14 @@ int myfs_mkfs() {
 
 	superblock->d_start_blk = superblock->i_start_blk + total_required_blocks;
 
+	// Write superblock
+	if (block_write(SUPERBLOCK_BLK_NUM, (void*)superblock) == -1) {
+		free(inode_bitmap);
+		free(data_bitmap);
+	
+		return -1;
+	}
+
 	// Update inode for root directory
 	struct inode root_inode;
 	
@@ -505,7 +504,7 @@ int myfs_mkfs() {
 	root_inode.valid = 1;
 	root_inode.size = 0;
 	root_inode.type = S_IFDIR | 0755; // directory with rwxr-xr-x permission
-	root_inode.nlink = 2; // . and ..
+	root_inode.nlink = 0;
 	
 	root_inode.atime = now();
 	root_inode.mtime = now();
@@ -524,15 +523,23 @@ int myfs_mkfs() {
 		return -1;
 	}
 
-	dir_add(&root_inode, ROOT_INODE, ".", 1);
+	// if (dir_add(&root_inode, ROOT_INODE, ".", 1) == -1) {
+	// 	perror("Cannot add entry to root directory");
 
-	// Write superblock
-	if (block_write(SUPERBLOCK_BLK_NUM, (void*)superblock) == -1) {
-		free(inode_bitmap);
-		free(data_bitmap);
+	// 	free(inode_bitmap);
+	// 	free(data_bitmap);
 
-		return -1;
-	}
+	// 	return -1;
+	// }
+
+	// if (dir_add(&root_inode, ROOT_INODE, "..", 2) == -1) {
+	// 	perror("Cannot add entry to root directory");
+
+	// 	free(inode_bitmap);
+	// 	free(data_bitmap);
+
+	// 	return -1;
+	// }
 
 	free(inode_bitmap);
 	free(data_bitmap);
@@ -571,7 +578,6 @@ static void  myfs_destroy(void *userdata) {
 }
 
 static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_info *fi) {
-
 	struct inode finode = { 0 };
 	
 	int res = get_node_by_path(path, ROOT_INODE, &finode); // start finding from the root
@@ -624,7 +630,7 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	}
 
 	struct inode dir_inode = { 0 };
-	
+
 	if (read_inode(fi->fh - 1, &dir_inode) == -1) {
 		perror("Cannot read inode");
 
@@ -635,7 +641,7 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 		perror("Dir is not valid");
 		return -1;
 	}
-
+	
 	int total_dirent = dir_inode.size / sizeof(struct dirent);
 
 	// Figure out how many struct dirent can be put into a block
@@ -647,7 +653,7 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	// In case there are only a few dirents in a block
 	// we only need to read one block from direct pointer
 	if (num_blocks == 0) num_blocks = 1;
-
+	
 	struct dirent* block_buffer = (struct dirent*)malloc(BLOCK_SIZE);
 	
 	if (block_buffer == NULL) {
@@ -667,18 +673,22 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 		if (total_dirent_read == total_dirent) break;
 		
 		if (dir_inode.directs[b] == -1) continue;
-
+		
 		if (block_read(dir_inode.directs[b], block_buffer) == -1) {
 			perror("Unable to read block");
 
 			return -1;
 		}
-		
+
 		for (int i = 0; i < num_dirent_per_block && i < total_dirent; ++i) {
 			if (total_dirent_read == total_dirent) break;
 			
 			entry = block_buffer[i];
-			
+
+			printf("\tItem[%d]: %s\n", i, entry.name);
+
+			dump_str(entry.name, entry.len + 1);
+						
 			if (entry.valid == 1) {
 				if (filler(buffer, entry.name, NULL, 0, 0) != 0) {
 					perror("filler");
@@ -787,13 +797,13 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	new_dir_inode.ctime = now();
 
 	write_inode(ino, &new_dir_inode);
-
+	
 	dir_add(&new_dir_inode, ino, ".", 1);
-
+	
 	dir_add(&new_dir_inode, parent_inode.ino, "..", 2);
 	
 	dir_add(&parent_inode, ino, base, strlen(base));
-
+	
 	free(dir);
 	free(base);
 
@@ -825,7 +835,7 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 		if (base) free(base);
 		if (dir) free(dir);
 	}
-
+	
 	// Get parent inode and check if the target file is already exist
 	struct inode parent_inode = { 0 };
 
@@ -928,8 +938,6 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 
 	read_inode(fi->fh - 1, &finode);
 
-	assert(finode.type == __S_IFREG);
-
 	if (finode.valid == 0) {
 		perror("File is not valid");
 
@@ -997,8 +1005,6 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 
 		return -1;
 	}
-
-	assert(finode.type == __S_IFREG);
 
 	if (finode.valid == 0) {
 		perror("File is not valid");
