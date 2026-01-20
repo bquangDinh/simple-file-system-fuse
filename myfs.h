@@ -10,13 +10,19 @@
 #ifndef _MYFS_H_
 #define _MYFS_H_
 
-#define ROOT_INODE 0 // default inode number of root is 0
+#define ENABLE_DEBUG_PRINTF
+
+#ifdef ENABLE_DEBUG_PRINTF
+#define printf(...) printf(__VA_ARGS__)
+#else
+#define printf(...)
+#endif
+
 #define SUPERBLOCK_BLK_NUM 0
 
 #define MAGIC_NUM 0x1234
 
 // Maximum number of inodes in inode region
-// Each inode occupies one page
 #define MAX_INODE_NUM 1024
 
 // Maximum number of data blocks in data region
