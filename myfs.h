@@ -40,9 +40,11 @@ struct superblock {
 
 struct inode {
 	uint16_t ino;				// inode number
+	uint16_t container_ino;		// inode number of parent
 	uint16_t valid;				// bit check if inode is valid
 	uint32_t size;				// size of the file
 	uint32_t type;				// type of the file
+	mode_t mode;
 	uint32_t nlink;				// link count
 	uint32_t uid;				// user id
 	uint32_t gid;				// group id

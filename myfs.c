@@ -102,13 +102,93 @@ int get_avail_blkno() {
 
 			free(bitmap_block);
 
-			return i + superblock->d_start_blk;
+			int return_block_idx = i + superblock->d_start_blk;
+
+			// Make sure the data block is fresh
+			void* buff = malloc(BLOCK_SIZE);
+
+			if (buff == NULL) {
+				perror("Cannot allocate memory");
+
+				return -1;
+			}
+
+			memset(buff, 0, BLOCK_SIZE);
+
+			if (block_write(return_block_idx, buff) == -1) {
+				perror("Cannot write data block");
+
+				free(buff);
+
+				return -1;
+			}
+
+			return return_block_idx;
 		}
 	}
 
 	free(bitmap_block);
 	
 	return -1;
+}
+
+int return_ino(int ino) {
+	assert(superblock != NULL);
+
+	assert(ino >= 0 && ino < superblock->max_inum);
+
+	bitmap_t bitmap_block = (bitmap_t)malloc(BLOCK_SIZE);
+	
+	if (block_read(superblock->i_bitmap_blk, bitmap_block) == -1) {
+		perror("Unable to read inode bitmap");
+		
+		free(bitmap_block);
+
+		return -1;
+	}
+
+	unset_bitmap(bitmap_block, ino);
+
+	return 0;
+}
+
+int return_data_block(int data_block) {
+	assert(superblock != NULL);
+
+	assert(data_block >= superblock->d_start_blk);
+
+	bitmap_t bitmap_block = (bitmap_t)malloc(BLOCK_SIZE);
+
+	if (block_read(superblock->d_bitmap_blk, bitmap_block) == -1) {
+		perror("Unable to read data bitmap");
+		
+		free(bitmap_block);
+
+		return -1;
+	}
+
+	unset_bitmap(bitmap_block, data_block);
+
+	// Reset data block
+	void* buff = malloc(BLOCK_SIZE);
+
+	if (buff == NULL) {
+		perror("Cannot allocate memory");
+
+		return -1;
+	}
+
+	memset(buff, 0, BLOCK_SIZE);
+
+	if (block_write(data_block, buff) == -1) {
+		perror("Cannot write data block");
+
+		free(buff);
+
+		return -1;
+	}
+
+	return 0;
 }
 
 /**
@@ -165,6 +245,7 @@ int write_inode(uint16_t ino, struct inode* inode) {
 	}
 
 	inode_table[inode_index].ino = inode->ino;
+	inode_table[inode_index].container_ino = inode->container_ino;
 	inode_table[inode_index].valid = inode->valid;
 	inode_table[inode_index].size = inode->size;
 	inode_table[inode_index].type = inode->type;
@@ -248,75 +329,221 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 	if (dir_find(dir_inode->ino, fname, name_len, &existing_entry) == 0) {
 		return -EEXIST;
 	}
-
-	// Find out which data block has space to add entry
-	// adding sizeof(struct dirent) is to make sure it round it down to the next available block, for example if block 1 and 2 is full, without adding sizeof(), it will return the index of 2, instead of 3 (which is the next one empty)
-	int block_index = (int)floor((float)(dir_inode->size + sizeof(struct dirent)) / BLOCK_SIZE);
 	
-	int num_dirents = dir_inode->size / sizeof(struct dirent);
-
-	int next_avail_index = num_dirents % BLOCK_SIZE;
-		
-	struct dirent entry;
-
-	entry.ino = f_ino;
-	entry.valid = 1;
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 	
-	if (name_len >= NAME_MAX) name_len = NAME_MAX - 1; 
+	// Find the first free slot or append it at the end
+	int block_idx = 0;
 
-	strncpy(entry.name, fname, name_len);
+	int num_dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
 
-	entry.name[name_len] = '\0';
+	for (; block_idx < DIRECT_PTRS_COUNT; ++block_idx) {
+		if (dir_inode->directs[block_idx] == -1) continue;
 
-	entry.len = name_len;
-	
-	struct dirent* entry_table = (struct dirent*)malloc(BLOCK_SIZE);
-	
-	if (dir_inode->directs[block_index] == -1) {
-		int next_avail_block = get_avail_blkno();
+		for (int i = 0; i < num_dirents_per_block; ++i) {
+			if (buffer[i].valid == 0) {
+				// Valid free spot
+				buffer[i].ino = f_ino;
+				buffer[i].valid = 1;
+				strncpy(buffer[i].name, fname, name_len);
+				buffer[i].len = name_len;
 
-		if (next_avail_block == -1) {
-			return -ENOSPC;
-		}	
+				if (block_write(dir_inode->directs[block_idx], buffer) == -1) {
+					perror("Cannot write data block");
+					
+					free(buffer);
 
-		dir_inode->directs[block_index] = next_avail_block;
+					return -1;
+				}
+				
+				// Update size
+				dir_inode->size += sizeof(struct dirent);
+
+				if (write_inode(dir_inode->ino, dir_inode) == -1) {
+					perror("Cannot write inode");
+
+					free(buffer);
+
+					return -1;
+				}
+
+				free(buffer);
+
+				return 0;
+			}
+		}
 	}
+	
+	if (block_idx == DIRECT_PTRS_COUNT) return -ENOSPC;
 
-	if (block_read(dir_inode->directs[block_index], entry_table) == -1) {
-		perror("Unable to obtain entry table");
+	assert(dir_inode->directs[block_idx] == -1);
 
-		free(entry_table);
+	int data_block_idx = get_avail_blkno();
+
+	if (data_block_idx == -1) return -ENOSPC;
+
+	dir_inode->directs[block_idx] = data_block_idx;
+
+	buffer[0].ino = f_ino;
+	buffer[0].valid = 1;
+	strncpy(buffer[0].name, fname, name_len);
+	buffer[0].len = name_len;
+
+	if (block_write(data_block_idx, buffer) == -1) {
+		perror("Cannot write data block");
 
 		return -1;
 	}
 
-	entry_table[next_avail_index].ino = entry.ino;
-	entry_table[next_avail_index].len = entry.len;
-	strncpy(entry_table[next_avail_index].name, entry.name, entry.len);
-	entry_table[next_avail_index].valid = entry.valid;
-
-	if (block_write(dir_inode->directs[block_index], (void*)entry_table) == -1) {
-		perror("Unable to write entry table");
-		
-		free(entry_table);
-
-		return -1;	
-	}
-
-	// Update dir inode
+	// Update size
 	dir_inode->size += sizeof(struct dirent);
 
 	if (write_inode(dir_inode->ino, dir_inode) == -1) {
-		perror("Cannot write inode of dir node");
-		
-		free(entry_table);
+		perror("Cannot write inode");
+
+		free(buffer);
 
 		return -1;
 	}
 
-	free(entry_table);
-	
+	free(buffer);
+
 	return 0;
+}
+
+/**
+ * Remove an entry from a directory
+ */
+int dir_remove(struct inode* dir_inode, uint16_t f_ino) {
+	assert(f_ino != ROOT_INODE);
+	assert(dir_inode->ino != f_ino);
+
+	int num_blocks = dir_inode->size / BLOCK_SIZE;
+
+	if (num_blocks == 0) num_blocks = 1;
+
+	int num_entry = dir_inode->size / sizeof(struct dirent);
+	
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+
+	for (int i = 0; i < num_blocks && i < DIRECT_PTRS_COUNT; ++i) {
+		if (dir_inode->directs[i] == -1) continue;
+
+		if (block_read(dir_inode->directs[i], buffer) == -1) {
+			perror("Unable to read data block");
+			
+			free(buffer);
+
+			return -1;
+		}
+
+		for (int j = 0; j < num_entry; ++j) {
+			if (buffer[j].valid == 1 && buffer[j].ino == f_ino) {
+				buffer[j].valid = 0; // mark as invalid or free slot
+				buffer[j].name[0] = '\0';
+
+				if (block_write(dir_inode->directs[i], buffer) == -1) {
+					perror("Unale to write data block");
+
+					free(buffer);
+
+					return -1;
+				}
+
+				dir_inode->size -= sizeof(struct dirent);
+
+				if (write_inode(dir_inode->ino, dir_inode) == -1) {
+					perror("Cannot write inode");
+
+					free(buffer);
+
+					return -1;
+				}
+
+				return 0;
+			}
+		}
+	}
+
+	// target does not exist
+	free(buffer);
+
+	return 0;
+}
+
+/**
+ * Return a list of dirents from a dir inode
+ */
+struct dirent* get_dirent_from_dir(struct inode* dir_inode, int* out_num_dirents, int* out_flag) {
+	// Assume only direct pointers
+	assert(dir_inode->type == S_IFDIR);
+
+	int num_dirents = dir_inode->size / sizeof(struct dirent);
+
+	if (num_dirents == 2) {
+		// Only '.' and '..' consider the directory is empty
+
+		*out_num_dirents = 0;
+
+		*out_flag = 0;
+
+		return NULL;
+	}
+
+	int num_dirents_per_block = BLOCK_SIZE / sizeof(struct dirent);
+
+	*out_num_dirents = num_dirents;
+
+	struct dirent* res = (struct dirent*)malloc(num_dirents * sizeof(struct dirent));
+
+	if (res == NULL) {
+		perror("Cannot allocate memory");
+
+		*out_flag = -ENOSPC;
+
+		return NULL;
+	}
+
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot alllocate memory");
+
+		*out_flag = -ENOSPC;
+
+		return NULL;
+	}
+
+	int current_read = 0;
+
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (current_read == num_dirents) break;
+
+		if (dir_inode->directs[i] == -1) continue;;
+		
+		if (block_read(dir_inode->directs[i], (void*)buffer) == -1) {
+			perror("Cannot read block");
+
+			*out_flag = -1;
+
+			return NULL;
+		}
+
+		for (int j = 0; j < num_dirents_per_block; ++j) {
+			if (current_read == num_dirents) break;
+
+			res[current_read].ino = buffer[j].ino;
+			res[current_read].valid = buffer[j].valid;
+			strncpy(res[current_read].name, buffer[j].name, buffer[j].len);
+			res[current_read].len = buffer[j].len;
+
+			current_read++;
+		}
+	}
+
+	free(buffer);
+
+	return res;
 }
 
 /**
@@ -334,6 +561,7 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	// Start walking from the root node
 	if (read_inode(ino, &current) == -1) {
 		perror("Cannot read inode");
+
 		return -1;
 	}
 	
@@ -353,7 +581,7 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 			//
 			free(path_clone);
 
-			return -1;
+			return -ENOENT;
 		}
 
 		// Read inode of the token, then move current to token's inode
@@ -501,6 +729,7 @@ int myfs_mkfs() {
 	struct inode root_inode;
 	
 	root_inode.ino = ROOT_INODE;
+	root_inode.container_ino = ROOT_INODE;
 	root_inode.valid = 1;
 	root_inode.size = 0;
 	root_inode.type = S_IFDIR | 0755; // directory with rwxr-xr-x permission
@@ -781,9 +1010,11 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	struct inode new_dir_inode;
 
 	new_dir_inode.ino = ino;
+	new_dir_inode.container_ino = parent_inode.ino;
 	new_dir_inode.valid = 1;
 	new_dir_inode.size = 0;
-	new_dir_inode.type = S_IFDIR | mode;
+	new_dir_inode.type = S_IFDIR;
+	new_dir_inode.mode = mode;
 	new_dir_inode.nlink = 2; // . and ..
 	
 	memset(new_dir_inode.directs, -1, DIRECT_PTRS_COUNT * sizeof(int));
@@ -882,9 +1113,11 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 	struct inode new_file_inode;
 
 	new_file_inode.ino = ino;
+	new_file_inode.container_ino = parent_inode.ino;
 	new_file_inode.valid = 1;
 	new_file_inode.size = 0;
-	new_file_inode.type = __S_IFREG | mode;
+	new_file_inode.type = __S_IFREG;
+	new_file_inode.mode = mode;
 	new_file_inode.nlink = 1;
 
 	memset(new_file_inode.directs, -1, DIRECT_PTRS_COUNT * sizeof(int));
@@ -937,6 +1170,12 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 	}
 
 	read_inode(fi->fh - 1, &finode);
+
+	if (finode.type != __S_IFREG) {
+		perror('Not a file');
+
+		return -1;
+	}
 
 	if (finode.valid == 0) {
 		perror("File is not valid");
@@ -1002,6 +1241,12 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 
 	if (read_inode(fi->fh - 1, &finode) == -1) {
 		perror("read_inode");
+
+		return -1;
+	}
+
+	if (finode.type != __S_IFREG) {
+		perror("Not a file");
 
 		return -1;
 	}
@@ -1088,6 +1333,67 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 }
 
 static int myfs_rmdir(const char* path) {
+	assert(superblock != NULL);
+
+	// Check if path is root
+	// we cannot delete root folder
+	if (strcmp(path, "/") == 0) {
+		perror("Cannot remove root folder");
+
+		return -1;
+	}
+	
+	// Check if dir is empty
+	// We cannot delete a non-empty directory
+	struct inode dir_inode = { 0 };
+
+	int res = get_node_by_path(path, ROOT_INODE, &dir_inode);
+
+	if (res == -1) {
+		perror("Cannot read inode by path");
+
+		return -1;
+	} else if (res == -ENOENT) {
+		perror("Directory does not exist");
+
+		return -ENOENT;
+	}
+
+	if (dir_inode.size > 2 * sizeof(struct dirent)) {
+		// dir not is empty
+		// 2 is because every dir has at least 2 entries '.' and '..'
+		perror("Directory is not empty");
+
+		return -ENOTEMPTY;
+	}
+
+	// Return inode back to bitmap
+	return_ino(dir_inode.ino);
+
+	// Return data block back to bitmap
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (dir_inode.directs[i] == -1) continue;;
+
+		return_data_block(dir_inode.directs[i]);
+	}
+
+	// TODO: indirect ptr
+
+	// Delete entry from parent
+	struct inode parent_inode = { 0 };
+
+	if (read_inode(dir_inode.container_ino, &parent_inode) == -1) {
+		perror("Cannot read inode");
+
+		return -1;
+	}
+
+	if (dir_remove(&parent_inode, dir_inode.ino) == -1) {
+		perror("Cannot remove dir entry");
+
+		return -1;
+	}
+
 	return 0;
 }
 
