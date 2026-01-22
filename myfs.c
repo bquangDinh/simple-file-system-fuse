@@ -1552,7 +1552,7 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 	if (finode.valid == 0) {
 		return -ENOENT;
 	}
-
+	
 	fi->fh = (uint64_t)finode.ino + 1;
 
 	printf("[myfs_open] Done.\n");
@@ -1766,6 +1766,18 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 	printf("[myfs_write] Done.\n");
 
 	return bytes_written;
+}
+
+static off_t myfs_lseek(const char* path, off_t off, int whence, struct fuse_file_info *fi) {
+	return 0;
+}
+
+static int myfs_fsync(const char* path, int d, struct fuse_file_info* fi) {
+	return 0;
+}
+
+static int myfs_rename(const char* path, const char* name, unsigned int flags) {
+	return 0;
 }
 
 static int myfs_rmdir(const char* path) {
@@ -2055,6 +2067,27 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 	return 0;
 }
 
+static int myfs_fallocate(const char* path, int a, off_t b, off_t c, struct fuse_file_info* fi) {
+	return 0;
+}
+
+static ssize_t myfs_copy_file_range(
+	const char* path_in, 
+	struct fuse_file_info* fi_in, 
+	off_t offset_in, 
+	const char* path_out, 
+	struct fuse_file_info *fi_out, 
+	off_t offset_out, 
+	size_t size, 
+	int flags
+) {
+	return 0;
+}
+
+static int myfs_flock(const char* path, struct fuse_file_info *fi, int op) {
+	return 0;
+}
+
 static int myfs_symlink(const char* target, const char* link) {
 	assert(target != NULL);
 	assert(link != NULL);
@@ -2337,7 +2370,9 @@ static struct fuse_operations myfs_ope = {
 	.open = myfs_open,
 	.read = myfs_read,
 	.write = myfs_write,
-
+	.lseek = myfs_lseek,
+	.fsync = myfs_fsync,
+	.rename = myfs_rename,
 	.rmdir = myfs_rmdir,
 	.releasedir = myfs_releasedir,
 	.unlink = myfs_unlink,
@@ -2347,7 +2382,10 @@ static struct fuse_operations myfs_ope = {
 	.truncate = myfs_truncate,
 	.flush = myfs_flush,
 	.utimens = myfs_utimens,
-	.release = myfs_release
+	.release = myfs_release,
+	.fallocate = myfs_fallocate,
+	.copy_file_range = myfs_copy_file_range,
+	.flock = myfs_flock
 };
 
 // Entry point of the library

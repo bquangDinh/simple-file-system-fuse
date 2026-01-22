@@ -61,6 +61,13 @@ struct inode {
 	int indirect_ptr;
 };
 
+// Open File Descriptor
+struct FD {
+	uint16_t ino;
+	off_t offset;
+	uint16_t refcounts;
+};
+
 struct dirent {
 	uint16_t ino;				// inode number
 	uint16_t valid;				// bit check if directory entry is valid
