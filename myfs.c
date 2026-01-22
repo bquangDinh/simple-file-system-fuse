@@ -279,7 +279,7 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	uint32_t inode_index = ino % BLOCK_SIZE;
 	uint32_t offset = superblock->i_start_blk;
 
-	printf("\tRead from block %d at index %d, offset: %d\n", block_index, inode_index, offset);
+	printf("\tRead from block %d at index %d, offset: %d\n", block_index + offset, inode_index, offset);
 
 	struct inode* inode_table = (struct inode*)malloc(BLOCK_SIZE);
 	
@@ -482,6 +482,14 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 	if (dir_find(dir_inode->ino, fname, name_len, NULL) == 0) {
 		return -EEXIST;
 	}
+
+	struct inode f_inode = { 0 };
+
+	if (read_inode(f_ino, &f_inode) == -1) {
+		perror("Cannot read inode");
+
+		return -1;
+	}
 	
 	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 
@@ -500,8 +508,18 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 		// Add item to the first unallocated block found
 		if (dir_inode->directs[block_idx] < 0) break;
 
+		printf("\tBlock %d is available\n", dir_inode->directs[block_idx]);
+
+		if (block_read(dir_inode->directs[block_idx], buffer) == -1) {
+			perror("Cannot read block");
+
+			free(buffer);
+
+			return -1;
+		}
+
 		for (int i = 0; i < num_dirents_per_block; ++i) {			
-			printf("\tChecking spot %d at block %d\n", i, dir_inode->directs[block_idx]);
+			printf("\tChecking spot %d (valid=%d) at block %d\n", i, buffer[i].valid, dir_inode->directs[block_idx]);
 
 			if (buffer[i].valid == 0) {
 				printf("\tFound a free spot at %d at block %d\n", i, dir_inode->directs[block_idx]);
@@ -530,7 +548,14 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 				// Update size
 				dir_inode->size += sizeof(struct dirent);
 				
-				printf("\tUpdated dir size to: %u\n", dir_inode->size);
+				printf("\tUpdated parent dir size to: %u\n", dir_inode->size);
+
+				// num nlink of dir = 2 + num sub directories
+				if (f_inode.type == S_IFDIR && f_inode.ino != dir_inode->ino) {
+					dir_inode->nlink++;
+				}
+
+				printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
 
 				if (write_inode(dir_inode->ino, dir_inode) < 0) {
 					perror("Cannot write inode");
@@ -539,12 +564,30 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 
 					return -1;
 				}
+				
+				// Update link count of target ino
+				// To prevent dir_add adding itself
+				if (f_ino != dir_inode->ino) {
+					f_inode.nlink++;
+
+					if (write_inode(f_ino, &f_inode) == -1) {
+						perror("Cannot write inode");
+
+						free(buffer);
+
+						return -1;
+					}
+
+					printf("\tUpdated entry ino: %d nlink to %d\n", f_inode.ino, f_inode.nlink);
+				}
 
 				free(buffer);
 
 				printf("[dir_add] Done.\n");
 
 				return 0;
+			} else {
+				printf("\tItem at spot %d is %s ino: %d\n", i, buffer[i].name, buffer[i].ino);
 			}
 		}
 	}
@@ -557,7 +600,12 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 
 	if (data_block_idx < 0) return -ENOSPC;
 
+	printf("\tAssigned data block %d\n", data_block_idx);
+	
 	dir_inode->directs[block_idx] = data_block_idx;
+
+	// memset the buffer to zero before fill
+	memset(buffer, 0, BLOCK_SIZE);
 
 	buffer[0].ino = f_ino;
 	buffer[0].valid = 1;
@@ -582,12 +630,38 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 
 	printf("\tUpdated dir size to: %u\n", dir_inode->size);
 
+	// num nlink of dir = 2 + num sub directories
+	if (f_inode.type == S_IFDIR) {
+		dir_inode->nlink++;
+	}
+
+	printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
+
 	if (write_inode(dir_inode->ino, dir_inode) < 0) {
 		perror("Cannot write inode");
 
 		free(buffer);
 
 		return -1;
+	}
+
+	printf("\tWrote parent inode update\n");
+
+	// Update link count of target ino
+	if (f_ino != dir_inode->ino) {
+		printf("\tf_ino = %d | dir ino = %d\n", f_ino, dir_inode->ino);
+
+		f_inode.nlink++;
+
+		if (write_inode(f_ino, &f_inode) == -1) {
+			perror("Cannot write inode");
+
+			free(buffer);
+
+			return -1;
+		}
+
+		printf("\tUpdated entry ino: %d nlink to %d\n", f_inode.ino, f_inode.nlink);
 	}
 
 	free(buffer);
@@ -600,59 +674,99 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 /**
  * Remove an entry from a directory
  */
-int dir_remove(struct inode* dir_inode, uint16_t f_ino) {
-	// assert(f_ino != ROOT_INODE);
-	// assert(dir_inode->ino != f_ino);
-
-	// int num_blocks = dir_inode->size / BLOCK_SIZE;
-
-	// if (num_blocks == 0) num_blocks = 1;
-
-	// int num_entry = dir_inode->size / sizeof(struct dirent);
+int dir_remove(struct inode* dir_inode, struct inode* entry_inode) {
+	assert(superblock != NULL);
+	assert(dir_inode != NULL);
+	assert(entry_inode != NULL);
+	assert(entry_inode->ino < superblock->max_inum);
+	assert(dir_inode->ino != entry_inode->ino);
 	
-	// struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+	printf("[dir_remove] parent ino: %d about to remove ino: %d\n", dir_inode->ino, entry_inode->ino);
 
-	// for (int i = 0; i < num_blocks && i < DIRECT_PTRS_COUNT; ++i) {
-	// 	if (dir_inode->directs[i] < 0) continue;
+	int num_entry = dir_inode->size / sizeof(struct dirent);
 
-	// 	if (block_read(dir_inode->directs[i], buffer) < 0) {
-	// 		perror("Unable to read data block");
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
+	
+	printf("\tNum entries: %d | Num entries per block: %d\n", num_entry, num_entries_per_block);
+
+	int entries_read = 0;
+
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -1;
+	}
+
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (entries_read == num_entry) break;
+
+		if (dir_inode->directs[i] < 0) continue;
+
+		if (block_read(dir_inode->directs[i], buffer) < 0) {
+			perror("Cannot read block");
 			
-	// 		free(buffer);
+			free(buffer);
 
-	// 		return -1;
-	// 	}
+			return -1;
+		}
 
-	// 	for (int j = 0; j < num_entry; ++j) {
-	// 		if (buffer[j].valid == 1 && buffer[j].ino == f_ino) {
-	// 			buffer[j].valid = 0; // mark as invalid or free slot
-	// 			buffer[j].name[0] = '\0';
+		for (int j = 0; j < num_entries_per_block; ++j, ++entries_read) {
+			if (entries_read == num_entry) break;
 
-	// 			if (block_write(dir_inode->directs[i], buffer) < 0) {
-	// 				perror("Unale to write data block");
+			if (buffer[j].valid == 1 && buffer[j].ino == entry_inode->ino) {
+				buffer[j].valid = 0; // mark as invalid or free slot
+				buffer[j].name[0] = '\0';
 
-	// 				free(buffer);
+				if (block_write(dir_inode->directs[i], buffer) < 0) {
+					perror("Cannot write block");
 
-	// 				return -1;
-	// 			}
+					free(buffer);
 
-	// 			dir_inode->size -= sizeof(struct dirent);
+					return -1;
+				}
 
-	// 			if (write_inode(dir_inode->ino, dir_inode) < 0) {
-	// 				perror("Cannot write inode");
+				dir_inode->size -= sizeof(struct dirent);
 
-	// 				free(buffer);
+				printf("\tUpdated size of dir: %u\n", dir_inode->size);
 
-	// 				return -1;
-	// 			}
+				if (entry_inode->type == S_IFDIR) {
+					dir_inode->nlink--;
+				}
 
-	// 			return 0;
-	// 		}
-	// 	}
-	// }
+				printf("\tUpdated parent ino %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
 
-	// // target does not exist
-	// free(buffer);
+				if (write_inode(dir_inode->ino, dir_inode) < 0) {
+					perror("Cannot write inode");
+
+					free(buffer);
+
+					return -1;
+				}
+
+				// Update nlink of target inode
+				entry_inode->nlink--;
+
+				if (write_inode(entry_inode->ino, entry_inode) < 0) {
+					perror("Cannot write inode");
+
+					return -1;
+				}
+
+				printf("\tUpdated nlink of target ino: %d to be = %d\n", entry_inode->ino, entry_inode->nlink);
+
+				printf("[dir_remove] Done.\n");
+
+				return 0;
+			}
+		}
+	}
+
+	printf("\tf_ino: %d does not exist in ino: %d\n", entry_inode->ino, dir_inode->ino);
+
+	// target does not exist
+	free(buffer);
 
 	return -1;
 }
@@ -669,8 +783,14 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	assert(inode != NULL);
 
 	// If the given path is the root directory, just return it
+	printf("\tIs this root node: %d\n", strcmp(path, "/"));
+
 	if (strcmp(path, "/") == 0) {
-		read_inode(ROOT_INO, inode);
+		if (read_inode(ROOT_INO, inode) < 0) {
+			perror("Cannot read inode");
+
+			return -1;
+		}
 
 		return 0;
 	}
@@ -722,6 +842,8 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 
 	// Copy current inode to output inode
 	memcpy(inode, &current, sizeof(struct inode));
+
+	printf("[ALERT] ino: %d | size = %u\n", inode->ino, inode->size);
 
 	free(path_clone);
 		
@@ -957,6 +1079,20 @@ int init_inode_region() {
 	}
 
 	printf("\tSaved root inode\n");
+
+	if (dir_add(&root_inode, ROOT_INO, ".", 1) < 0) {
+		perror("Cannot add entry to root inode");
+
+		free(buffer);
+
+		return -1;
+	}
+
+	struct inode test_root_inode = { 0 };
+	
+	read_inode(ROOT_INO, &test_root_inode);
+
+	printf("[ROOT ALERT] size = %u\n", test_root_inode.size);
 
 	free(buffer);
 
@@ -1250,7 +1386,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return -ENOSPC;
 	}
 
-	struct inode new_dir_inode = make_inode(ino, parent_inode.ino, S_IFDIR, mode, 2);
+	struct inode new_dir_inode = make_inode(ino, parent_inode.ino, S_IFDIR, mode, 0);
 
 	if (write_inode(ino, &new_dir_inode) < 0) {
 		perror("Cannot write inode");
@@ -1290,7 +1426,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	free(dir);
 	free(base);
 
-	printf("[myfs_readdir] Done.\n");
+	printf("[myfs_mkdir] Done.\n");
 
 	return 0;
 }
@@ -1349,6 +1485,8 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 		return -ENOENT;
 	}
 
+	printf("\t[ALERT] parent ino: %d | size = %u\n", parent_inode.ino, parent_inode.size);
+
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
 		free(base);
@@ -1367,7 +1505,7 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 		return -ENOSPC;
 	}
 
-	struct inode new_file_inode = make_inode(ino, parent_inode.ino, __S_IFREG, mode, 1);
+	struct inode new_file_inode = make_inode(ino, parent_inode.ino, __S_IFREG, mode, 0);
 
 	if (write_inode(ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
@@ -1631,18 +1769,277 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 }
 
 static int myfs_rmdir(const char* path) {
+	assert(path != NULL);
+	assert(ROOT_INO != -1);
+	
+	printf("[myfs_rmdir] path: %s\n", path);
+
+	if (strcmp(path, "/") == 0) {
+		perror("Cannot remove root directory");
+
+		return -EBUSY;
+	}
+
+	struct inode dir_inode = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &dir_inode) < 0) {
+		return -ENOENT;
+	}
+
+	// Check if this is a directory
+	if (dir_inode.type != S_IFDIR) {
+		return -ENOTDIR;
+	}
+
+	// Can only delete empty dir
+	// Check if dir is empty
+	if (dir_inode.size > 2 * sizeof(struct dirent)) {
+		return -ENOTEMPTY;
+	}
+
+	printf("\tdir is a valid empty directory, can be removed\n");
+
+	struct inode parent_inode = { 0 };
+
+	if (read_inode(dir_inode.container_ino, &parent_inode) < 0) {
+		perror("Cannot read inode");
+
+		return -1;
+	}
+
+	printf("\tParent inode: %d\n", parent_inode.ino);
+
+	// Remove dir entry from parent
+	if (dir_remove(&parent_inode, &dir_inode) < 0) {
+		perror("Cannot remove dir entry from parent");
+
+		return -1;
+	}
+
+	// reset data block if it has any allocated data blocks
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (dir_inode.directs[i] < 0) continue;;
+
+		if (reset_data_block(dir_inode.directs[i]) < 0) {
+			perror("Cannot reset data block");
+
+			return -1;
+		}
+	}
+
+	if (dir_inode.indirect_ptr >= 0) {
+		if (reset_data_block(dir_inode.indirect_ptr) < 0) {
+			perror("Cannot reset data block");
+
+			return -1;
+		}
+	}
+
+	if (reset_ino(dir_inode.ino) < 0) {
+		perror("Cannot reset inode");
+
+		return -1;
+	}
+
+	printf("[myfs_rmdir] Done.\n\n");
+
 	return 0;
 }
 
 static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
+	// Simply remove fi->fh cache
+	fi->fh = 0;
+
 	return 0;
 }
 
 static int myfs_unlink(const char* path) {
+	assert(path != NULL);
+	assert(ROOT_INO != -1);
+
+	printf("[myfs_unlink] path: %s\n", path);
+
+	if (strcmp(path, "/") == 0) {
+		perror("Cannot remove root directory");
+
+		return -EISDIR;
+	}
+
+	struct inode f_inode = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &f_inode) < 0) {
+		return -ENOENT;
+	}
+
+	// Check if this is a file or a softlink
+	if (f_inode.type == S_IFDIR) {
+		return -EISDIR;
+	}
+
+	printf("\t File is a valid file to be removed\n");
+
+	struct inode parent_inode = { 0 };
+
+	if (read_inode(f_inode.container_ino, &parent_inode) < 0) {
+		perror("Cannot read inode");
+
+		return -1;
+	}
+
+	printf("\tParent inode: %d\n", parent_inode.ino);
+
+	// Remove file entry from parent dir
+	if (dir_remove(&parent_inode, &f_inode) < 0) {
+		perror("Cannot remove file entry from parent");
+
+		return -1;
+	}
+
+	// Check if nlink == 0
+	// If nlink is 0, remove the file content
+	// Simply returns its data blocks back to the file system
+	if (f_inode.nlink == 0) {
+		printf("\tFile ino: %d has 0 nlink, remove its data blocks\n", f_inode.ino);
+
+		for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+			if (f_inode.directs[i] >= 0) {
+				reset_data_block(f_inode.directs[i]);
+			}
+		}
+
+		if (f_inode.indirect_ptr >= 0) reset_data_block(f_inode.indirect_ptr);
+	}
+
+	printf("[myfs_unlink] Done.\n\n");
+
 	return 0;
 }
 
 static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
+	assert(path != NULL);
+	assert(size >= 0);
+	
+	printf("[myfs_truncate] path: %s | size: %ld\n", path, size);
+
+	if (fi->fh == 0) {
+		perror("Call open() before this operation");
+		
+		return -1;
+	}
+
+	struct inode f_inode = { 0 };
+
+	if (read_inode(fi->fh - 1, &f_inode) == -1) {
+		return -ENOENT;
+	}
+
+	if (f_inode.type == S_IFDIR) {
+		return -EISDIR;
+	}
+
+	if (f_inode.size == size) {
+		printf("\tFile size equals to requested size. Do nothing\n");
+
+		// Do nothing, only update timestamp
+		f_inode.atime = now();
+
+		if (write_inode(f_inode.ino, &f_inode) == -1) {
+			perror("Cannot write inode");
+
+			return -1;
+		}
+
+		printf("[myfs_truncate] Done.\n\n");
+
+		return 0;
+	}
+
+	if (f_inode.size == 0 || f_inode.size < size) {
+		printf("\tFile size is 0 or expanding, set to size = %d\n", size);
+
+		f_inode.size = size;
+
+		f_inode.atime = now();
+		f_inode.ctime = now();
+		f_inode.mtime = now();
+
+		if (write_inode(f_inode.ino, &f_inode) < 0) {
+			perror("Cannot write inode");
+
+			return -1;
+		}
+
+		printf("[myfs_truncate] Done.\n");
+
+		return 0;
+	}
+
+	printf("\tShrinking file size of %d to %d (removing %d)\n", f_inode.size, size, f_inode.size - size);
+
+	// Shrink
+	int req_blk_idx = size / BLOCK_SIZE;
+	int req_blk_offset = size % BLOCK_SIZE;
+
+	assert(f_inode.directs[req_blk_idx] >= 0);
+
+	printf("\tReq Blk Idx: %d | Req Blk Offset: %d\n", req_blk_idx, req_blk_offset);
+
+	// Remove all blocks beyond req_blk_idx
+	for (int i = req_blk_idx + 1; i < DIRECT_PTRS_COUNT; ++i) {
+		if (f_inode.directs[i] < 0) continue;
+
+		if (reset_data_block(f_inode.directs[i]) < 0) {
+			perror("Cannot reset data block");
+
+			return -1;
+		}
+	}
+
+	printf("\tRemoved all blocks after %d\n", req_blk_idx);
+
+	// Truncate block req_blk_idx (the rest is filled with zero)
+	void* buffer = malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -1;
+	}
+
+	if (block_read(f_inode.directs[req_blk_idx], buffer) < 0) {
+		perror("Cannot read block");
+
+		free(buffer);
+
+		return -1;
+	}
+
+	memset(buffer + req_blk_offset, 0, BLOCK_SIZE - req_blk_offset);
+
+	printf("\tSet to 0 of data block %d from offset %d | size %d\n", f_inode.directs[req_blk_idx], req_blk_offset, BLOCK_SIZE - req_blk_offset);
+
+	if (block_write(f_inode.directs[req_blk_idx], buffer) < 0) {
+		perror("Cannot write block");
+	}
+
+	// Update size
+	f_inode.size = size;
+
+	// Update time
+	f_inode.atime = now();
+	f_inode.mtime = now();
+	f_inode.ctime = now();
+
+	if (write_inode(f_inode.ino, &f_inode) < 0) {
+		perror("Cannot write inode");
+
+		return -1;
+	}
+
+	printf("\tUpdated f_inode size = %u\n", f_inode.size);
+
+	printf("[myfs_truncate] Done.\n");
+
 	return 0;
 }
 
@@ -1655,6 +2052,275 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 }
 
 static int myfs_release(const char* path, struct fuse_file_info *fi) {
+	return 0;
+}
+
+static int myfs_symlink(const char* target, const char* link) {
+	assert(target != NULL);
+	assert(link != NULL);
+	assert(ROOT_INO != -1);
+
+	printf("[myfs_symlink] target: %s | link: %s\n", target, link);
+	
+	printf("\tCreating symlink file\n");
+
+	char *tmp1, *tmp2;
+
+	tmp1 = strdup(link);
+	tmp2 = strdup(link);
+
+	if (tmp1 == NULL || tmp2 == NULL) {
+		perror("Cannot allocate memory");
+
+		if (tmp1) free(tmp1);
+		if (tmp2) free(tmp2);
+
+		return -ENOSPC;
+	}
+
+	char *base = basename(strdup(tmp1));
+	char *dir = dirname(strdup(tmp2));
+
+	free(tmp1);
+	free(tmp2);
+
+	if (base == NULL || dir == NULL) {
+		perror("Cannot allocate memory");
+
+		if (base) free(base);
+		if (dir) free(dir);
+
+		return -ENOSPC;
+	}
+
+	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
+
+	// Get parent inode and check if the target file is already exist
+	struct inode parent_inode = { 0 };
+
+	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
+		free(base);
+		free(dir);
+		
+		return -ENOENT;
+	}
+
+	if (parent_inode.valid == 0) {
+		free(base);
+		free(dir);
+
+		return -ENOENT;
+	}
+
+	// Check if the target file already exists
+	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
+		free(base);
+		free(dir);
+
+		return -EEXIST;
+	}
+
+	// Get the next available inode number for this file
+	int ino = get_avail_ino();
+
+	if (ino < 0) {
+		free(base);
+		free(dir);
+
+		return -ENOSPC;
+	}
+
+	struct inode new_file_inode = make_inode(ino, parent_inode.ino, __S_IFLNK, 0755, 0);
+
+	if (write_inode(ino, &new_file_inode) < 0) {
+		perror("Cannot write inode");
+
+		free(base);
+		free(dir);
+
+		return -1;
+	}
+
+	printf("\tWrote file inode ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+
+	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
+		perror("Cannot add dirent entry");
+
+		free(base);
+		free(dir);
+
+		return -1;
+	}
+
+	printf("\tAdded file entry ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+
+	printf("\tWriting file path to symlink\n");
+
+	size_t buffer_size = strlen(target) + 1;
+
+	printf("\tPath size in bytes = %zu\n", buffer_size);
+
+	// Path should have length less than a page
+	if (buffer_size > BLOCK_SIZE) {
+		perror("Path cannot longer than a page");
+
+		return -ENOSPC;
+	}
+
+	int blk_idx = get_avail_blkno();
+
+	if (blk_idx < 0) {
+		return -ENOSPC;
+	}
+
+	printf("\tAssigned data block %d to symlink file\n", blk_idx);
+
+	new_file_inode.directs[0] = blk_idx;
+	new_file_inode.size += buffer_size;
+
+	if (write_inode(new_file_inode.ino, &new_file_inode) < 0) {
+		perror("Cannot write inode");
+
+		return -1;
+	}
+
+	// Write path to block
+	char* buffer = (char*)malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -ENOSPC;
+	}
+
+	memcpy(buffer, target, buffer_size);
+
+	if (block_write(blk_idx, buffer) < 0) {
+		perror("Cannot write block");
+
+		free(buffer);
+
+		return -1;
+	}
+
+	printf("\tWrote path to file\n");
+
+	free(buffer);
+
+	printf("[myfs_symlink] Done.\n");
+
+	return 0;
+}
+
+static int myfs_link(const char* target, const char* link) {
+	assert(target != NULL);
+	assert(link != NULL);
+	assert(ROOT_INO != -1);
+
+	printf("[myfs_link] target: %s | link: %s\n", target, link);
+	
+	char *tmp1, *tmp2;
+
+	tmp1 = strdup(link);
+	tmp2 = strdup(link);
+
+	if (tmp1 == NULL || tmp2 == NULL) {
+		perror("Cannot allocate memory");
+
+		if (tmp1) free(tmp1);
+		if (tmp2) free(tmp2);
+
+		return -ENOSPC;
+	}
+
+	char *base = basename(strdup(tmp1));
+	char *dir = dirname(strdup(tmp2));
+
+	free(tmp1);
+	free(tmp2);
+
+	if (base == NULL || dir == NULL) {
+		perror("Cannot allocate memory");
+
+		if (base) free(base);
+		if (dir) free(dir);
+
+		return -ENOSPC;
+	}
+
+	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
+
+	struct inode parent_inode = { 0 };
+
+	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
+		free(base);
+		free(dir);
+
+		return -ENOENT;
+	}
+
+	if (parent_inode.valid == 0) {
+		free(base);
+		free(dir);
+
+		return -ENOENT;
+	}
+
+	struct inode target_inode = { 0 };
+
+	if (get_node_by_path(target, ROOT_INO, &target_inode) < 0) {
+		return -ENOENT;
+	}
+
+	if (dir_add(&parent_inode, target_inode.ino, base, strlen(base)) < 0) {
+		perror("Cannot add entry to directory");
+
+		return -1;
+	}
+
+	// free(base);
+	// free(dir);
+
+	printf("[myfs_link] Done.\n");
+
+	return 0;
+}
+
+static int myfs_readlink(const char* link, char* buffer, size_t len) {
+	assert(link != NULL);
+	assert(buffer != NULL);
+	assert(len > 0);
+
+	printf("[myfs_readlink] link: %s | len: %zu\n", link, len);
+
+	struct inode link_inode = { 0 };
+
+	if (get_node_by_path(link, ROOT_INO, &link_inode) < 0) {
+		return -ENOENT;
+	}
+
+	assert(link_inode.directs[0] >= 0);
+
+	char* blk_buffer = (char*)malloc(BLOCK_SIZE);
+
+	if (blk_buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -ENOSPC;
+	}
+
+	if (block_read(link_inode.directs[0], blk_buffer) < 0) {
+		perror("Cannot read block");
+
+		return -1;
+	}
+
+	memcpy(buffer, blk_buffer, len);
+
+	free(blk_buffer);
+
+	printf("[myfs_readlink] Done.\n");
+
 	return 0;
 }
 
@@ -1675,6 +2341,9 @@ static struct fuse_operations myfs_ope = {
 	.rmdir = myfs_rmdir,
 	.releasedir = myfs_releasedir,
 	.unlink = myfs_unlink,
+	.symlink = myfs_symlink,
+	.link = myfs_link,
+	.readlink = myfs_readlink,
 	.truncate = myfs_truncate,
 	.flush = myfs_flush,
 	.utimens = myfs_utimens,
