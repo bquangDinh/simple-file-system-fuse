@@ -51,7 +51,11 @@ struct inode {
 	uint32_t size;				// size of the file
 	uint32_t type;				// type of the file
 	mode_t mode;
+
+	// Note that file content deletion only happens when link count = 0 AND open_count = 0
 	uint32_t nlink;				// link count
+	uint32_t open_count;		// keep track of how many processes are opening this inode
+	
 	uint32_t uid;				// user id
 	uint32_t gid;				// group id
 	struct timespec atime;				// last access time
@@ -59,13 +63,6 @@ struct inode {
 	struct timespec ctime;				// last modification to inode time
 	int directs[DIRECT_PTRS_COUNT];
 	int indirect_ptr;
-};
-
-// Open File Descriptor
-struct FD {
-	uint16_t ino;
-	off_t offset;
-	uint16_t refcounts;
 };
 
 struct dirent {
