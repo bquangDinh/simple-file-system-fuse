@@ -85,3 +85,9 @@ int block_write(const int block_num, const void* buf) {
 
 	return write_bytes;
 }
+
+int dev_fsync() {
+	assert(diskfile != -1);
+
+	return fsync(diskfile);
+}

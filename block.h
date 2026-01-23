@@ -13,6 +13,8 @@ void dev_init(const char* diskfile_path);
  */
 int dev_open(const char* diskfile_path);
 
+int dev_fsync();
+
 /**
  * Close the storage file
  */
