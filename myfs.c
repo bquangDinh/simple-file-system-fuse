@@ -21,6 +21,10 @@
 #include "block.h"
 #include "myfs.h"
 
+#define ARRAY_FILL(arr, value, len) \
+	for (size_t i = 0; i < len; ++i) \
+		(arr)[i] = (value)
+
 char diskfile_path[PATH_MAX];
 
 struct superblock* superblock = NULL;
@@ -133,7 +137,7 @@ int get_avail_blkno() {
 
 	assert(num_bits_per_blocks > 0);
 
-	printf("\tReading %d blocks (%d bits) of inode bitmap\n", data_bitmap_blocks, num_bits_per_blocks);
+	printf("\tReading %d blocks (%d bits) of data bitmap\n", data_bitmap_blocks, num_bits_per_blocks);
 
 	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
 
@@ -301,6 +305,8 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	
 	free(inode_table);
 
+	printf("\tRead from inode table of ino: %d\n", inode->ino);
+
 	printf("[read_inode] Done.\n\n");
 
 	return 0;
@@ -379,7 +385,7 @@ struct inode make_inode(uint16_t ino, uint16_t container_ino, uint32_t type, mod
 	node.uid = getuid();
 	node.gid = getgid();
 
-	memset(node.directs, -1, DIRECT_PTRS_COUNT * sizeof(int));
+	ARRAY_FILL(node.directs, -1, DIRECT_PTRS_COUNT);
 	node.indirect_ptr = -1;
 
 	return node;
@@ -782,9 +788,6 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	assert(ino < superblock->max_inum);
 	assert(inode != NULL);
 
-	// If the given path is the root directory, just return it
-	printf("\tIs this root node: %d\n", strcmp(path, "/"));
-
 	if (strcmp(path, "/") == 0) {
 		if (read_inode(ROOT_INO, inode) < 0) {
 			perror("Cannot read inode");
@@ -843,11 +846,284 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	// Copy current inode to output inode
 	memcpy(inode, &current, sizeof(struct inode));
 
-	printf("[ALERT] ino: %d | size = %u\n", inode->ino, inode->size);
-
 	free(path_clone);
 		
 	return 0;
+}
+
+int file_write(struct inode* finode, const char* buffer, size_t size, off_t offset) {
+	printf("[file_write] Ino: %d | size: %zu | offset: %u\n", finode->ino, size, offset);
+
+	if (finode->type == S_IFDIR) {
+		return -EISDIR;
+	} 
+
+	if (finode->valid == 0) {
+		return -1;
+	}
+
+	size_t bytes_written = 0;
+	off_t current_offset = offset;
+	size_t remaining = size;
+	
+	size_t block_index, block_offset, to_write;
+	int writing_blk_num = -1;
+
+	void* block_buffer = malloc(BLOCK_SIZE);
+
+	if (block_buffer == NULL) {
+		return -ENOSPC;
+	}
+
+	while (remaining > 0) {
+		block_index = current_offset / BLOCK_SIZE;
+		block_offset = current_offset & BLOCK_SIZE;
+		to_write = BLOCK_SIZE - block_offset;
+
+		if (to_write > remaining) to_write = remaining;
+
+		if (block_index < DIRECT_PTRS_COUNT) {
+			printf("\tData block inside direct ptrs\n");
+
+			writing_blk_num = finode->directs[block_index];
+			
+			if (writing_blk_num < 0) {
+				printf("\tWriting blk num unallocated\n");
+
+				// Allocate new data block
+				writing_blk_num = get_avail_blkno();
+	
+				if (writing_blk_num < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+	
+				finode->directs[block_index] = writing_blk_num;
+
+				printf("\tAssigned block %d (th)\n", writing_blk_num);
+			}
+		} else {
+			printf("\tData block in indirect ptr region\n");
+
+			// In indirect region
+			int blk_idx = block_index - DIRECT_PTRS_COUNT;
+			int num_blks_indirect = BLOCK_SIZE / sizeof(int);
+
+			assert(blk_idx < num_blks_indirect);
+
+			printf("\tBlk idx: %d | num_blks_indirects: %d\n", blk_idx, num_blks_indirect);
+
+			if (finode->indirect_ptr < 0) {
+				printf("\tIndirect ptr unallocated\n");
+
+				// Allocate
+				int blk = get_avail_blkno();
+				
+				if (blk < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+
+				printf("\tAssigned block: %d to indirect ptr\n", blk);
+
+				// Initialize
+				int* init_buffer = (int*)malloc(BLOCK_SIZE);
+
+				if (init_buffer == NULL) {
+					return bytes_written == 0 ? -ENOSPC : bytes_written; 
+				}
+
+				// Do not use memset as it will set every individual byte to 1
+				// So the next time to read the array as an integer array
+				// C will group every 4 bytes to read an int, 0x01010101 is NOT -1
+				ARRAY_FILL(init_buffer, -1, num_blks_indirect);
+			
+				if (block_write(blk, init_buffer) < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -1 : bytes_written;  
+				}
+
+				finode->indirect_ptr = blk;
+
+				free(init_buffer);
+			}
+
+			// Read indirect data block
+			int* indirect_buffer = (int*)malloc(BLOCK_SIZE);
+
+			if (indirect_buffer == NULL) {
+				free(block_buffer);
+
+				return bytes_written == 0 ? -ENOSPC : bytes_written;
+			}
+
+			if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
+				free(block_buffer);
+
+				return bytes_written == 0 ? -1 : bytes_written;
+			}
+
+			if (indirect_buffer[blk_idx] == -1) {
+				// Allocate
+				writing_blk_num = get_avail_blkno();
+
+				printf("\tAllocate block %d of blk_idx %d\n", writing_blk_num, blk_idx);
+
+				if (writing_blk_num < 0) {
+					free(block_buffer);
+
+					free(indirect_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+
+				indirect_buffer[blk_idx] = writing_blk_num;
+			}
+		}
+
+		assert(writing_blk_num != -1);
+
+		printf("\tRead from block: %d\n", writing_blk_num);
+
+		if (block_read(writing_blk_num, block_buffer) < 0) {
+			free(block_buffer);
+
+			return bytes_written == 0 ? -1 : bytes_written;
+		}
+
+		if (to_write == BLOCK_SIZE) {
+			// rewrite the whole block
+			memcpy(block_buffer, buffer + bytes_written, to_write);
+		} else {
+			memcpy((char*)block_buffer + block_offset, buffer + bytes_written, to_write);
+		}
+
+		if (block_write(writing_blk_num, block_buffer) < 0) {
+			free(block_buffer);
+
+			return bytes_written == 0 ? -1 : bytes_written;
+		}
+
+		printf("\tWrite to block: %d\n", writing_blk_num);
+
+		bytes_written += to_write;
+		current_offset += to_write;
+		remaining -= to_write;
+	}
+
+	// Update file size in inode
+	if (offset + bytes_written > finode->size) {
+		finode->size = offset + bytes_written;
+	}
+
+	// Update time
+	finode->mtime = now();
+
+	if (write_inode(finode->ino, finode) < 0) {
+		perror("write_inode");
+
+		return bytes_written == 0 ? -1 : bytes_written;
+	}
+
+	free(block_buffer);
+
+	printf("[file_write] Done.\n\n");
+
+	return bytes_written;
+}
+
+int file_read(struct inode* finode, const char* buffer, size_t size, off_t offset) {
+	if (finode->type == S_IFDIR) {
+		return -EISDIR;
+	}
+
+	if (finode->valid == 0) {
+		return -1;
+	}
+
+	size_t bytes_read = 0;
+	off_t current_offset = offset;
+	size_t remaining = size;
+	
+	size_t block_index, block_offset, to_read;
+	int reading_blk_num = -1;
+
+	void* block_buffer = malloc(BLOCK_SIZE);
+
+	if (block_buffer == NULL) {
+		return -ENOSPC;
+	}
+
+	while (remaining > 0) {
+		block_index = current_offset / BLOCK_SIZE;
+		block_offset = current_offset & BLOCK_SIZE;
+		to_read = BLOCK_SIZE - block_offset;
+
+		if (to_read > remaining) to_read = remaining;
+
+		if (block_index < DIRECT_PTRS_COUNT) {
+			reading_blk_num = finode->directs[block_index];
+		} else {
+			// In indirect region
+			int blk_idx = block_index - DIRECT_PTRS_COUNT;
+			int num_blks_indirect = BLOCK_SIZE / sizeof(int);
+
+			assert(blk_idx < num_blks_indirect);
+
+			if (finode->indirect_ptr >= 0) {
+				// Read indirect data block
+				int* indirect_buffer = (int*)malloc(BLOCK_SIZE);
+
+				if (indirect_buffer == NULL) {
+					free(block_buffer);
+
+					return bytes_read == 0 ? -ENOSPC : bytes_read;
+				}
+
+				if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
+					free(block_buffer);
+	
+					return bytes_read == 0 ? -1 : bytes_read;
+				}
+
+				reading_blk_num = indirect_buffer[blk_idx];
+			}
+		}
+
+		if (reading_blk_num < 0) {
+			// Hole or unallocate data region
+			// return 0
+			memset(buffer + bytes_read, 0, to_read);
+		} else {
+			if (block_read(reading_blk_num, block_buffer) < 0) {
+				free(block_buffer);
+	
+				return bytes_read == 0 ? -1 : bytes_read;
+			}
+
+			memcpy(buffer + bytes_read, (char*)block_buffer + block_offset, to_read);
+		}
+
+		bytes_read += to_read;
+		current_offset += to_read;
+		remaining -= to_read;
+	}
+
+	// Update time
+	finode->atime = now();
+
+	if (write_inode(finode->ino, finode) < 0) {
+		perror("write_inode");
+
+		return bytes_read == 0 ? -1 : bytes_read;
+	}
+
+	free(block_buffer);
+
+	return bytes_read;
 }
 
 int init_superblock() {	
@@ -944,7 +1220,7 @@ int init_inode_bitmap() {
 
 	assert(inode_bitmap_blocks >= 1);
 
-	printf("\tSaving bitmap to %d blocks\n", inode_bitmap_blocks);
+	printf("\tSaving bitmap to %d blocks start from %u (th) block to %u (th) block\n", inode_bitmap_blocks, superblock->i_bitmap_blk, superblock->d_bitmap_blk - 1);
 
 	void* buffer = malloc(BLOCK_SIZE);
 
@@ -987,7 +1263,7 @@ int init_data_bitmap() {
 
 	assert(data_bitmap_blocks >= 1);
 
-	printf("\tSaving bitmap to %d blocks\n", data_bitmap_blocks);
+	printf("\tSaving bitmap to %d blocks start from %u (th) block to %u (th) block\n", data_bitmap_blocks, superblock->d_bitmap_blk, superblock->i_start_blk - 1);
 
 	void* buffer = malloc(BLOCK_SIZE);
 
@@ -1033,6 +1309,8 @@ int init_inode_region() {
 	int inode_blocks = superblock->d_start_blk - superblock->i_start_blk;
 
 	assert(inode_blocks >= 1);
+
+	printf("\tSaving inode region to %d blocks start from %u (th) block to %u (th) block\n", inode_blocks, superblock->i_start_blk, superblock->d_start_blk - 1);
 
 	void* buffer = malloc(BLOCK_SIZE);
 
@@ -1091,8 +1369,6 @@ int init_inode_region() {
 	struct inode test_root_inode = { 0 };
 	
 	read_inode(ROOT_INO, &test_root_inode);
-
-	printf("[ROOT ALERT] size = %u\n", test_root_inode.size);
 
 	free(buffer);
 
@@ -1533,8 +1809,6 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 		return -ENOENT;
 	}
 
-	printf("\t[ALERT] parent ino: %d | size = %u\n", parent_inode.ino, parent_inode.size);
-
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
 		free(base);
@@ -1695,63 +1969,19 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 		return -ENOENT;
 	}
 
-	if (offset >= finode.size) {
-		// offset is beyond file size
-		return 0;
-	}	
-
-	if (size + offset > finode.size) {
-		// cap size
-		size = finode.size - offset;
-	}
-
 	printf("\tReading file (%zu) of size: %u | offset: %ld\n", finode.size, size, offset);
 
-	size_t bytes_read = 0;
-	off_t current_offset = offset;
-	size_t remaining = size;
-	
-	void* block = malloc(BLOCK_SIZE);
+	int res;
 
-	if (block == NULL) {
-		perror("Cannot allocate memory");
-
-		return -ENOSPC;
+	if ((res = file_read(&finode, buffer, size, offset)) < 0) {
+		return res;
 	}
 
-	while (remaining > 0) {
-		size_t block_index = current_offset / BLOCK_SIZE;
-		size_t block_offset = current_offset % BLOCK_SIZE;
-		size_t to_read = BLOCK_SIZE - block_offset;
-
-		if (to_read > remaining) to_read = remaining;
-
-		// Assume we only use direct ptr firstly
-		assert(block_index < DIRECT_PTRS_COUNT);
-
-		int data_block_num = finode.directs[block_index];
-
-		if (data_block_num < 0) {
-			// not allocated
-			memset(buffer + bytes_read, 0, to_read);
-		} else {
-			block_read(data_block_num, block);
-
-			memcpy(buffer + bytes_read, (char*)block + block_offset, to_read);
-		}
-
-		bytes_read += to_read;
-		current_offset += to_read;
-		remaining -= to_read;
-	}
-
-	free(block);
-
-	printf("\tBytes read: %zu\n", bytes_read);
+	printf("\tBytes read: %zu\n", res);
 
 	printf("[myfs_read] Done.\n\n");
 
-	return bytes_read;
+	return res;
 }
 
 static int myfs_write(const char* path, const char* buffer, size_t size, off_t offset, struct fuse_file_info* fi) {
@@ -1775,7 +2005,7 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		return -1;
 	}
 
-	printf("\tRead inode with ino: %ld\n", fi->fh - 1);
+	printf("\tRead inode with ino: %ld | actual: %d\n", fi->fh - 1, finode.ino);
 
 	if (finode.type != __S_IFREG) {
 		perror("Not a file");
@@ -1789,83 +2019,17 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		return -ENOENT;
 	}
 
-	size_t bytes_written = 0;
-	off_t current_offset = offset;
-	size_t remaining = size;
-	
-	void* block_buffer = malloc(BLOCK_SIZE);
-	
-	if (block_buffer == NULL) {
-		perror("Cannot allocate memory");
+	int res = 0;
 
-		return -ENOSPC;
+	if ((res = file_write(&finode, buffer, size, (fi->flags & O_APPEND != 0) ? finode.size : offset)) < 0) {
+		return res;
 	}
 
-	// TODO: handle case when offset is beyond file size
-	// the portion from the last byte to offset should be allocated and then write
-	while (remaining > 0) {
-		size_t block_index = current_offset / BLOCK_SIZE;
-		size_t block_offset = current_offset % BLOCK_SIZE;
-		size_t to_write = BLOCK_SIZE - block_offset;
-
-		if (to_write > remaining) to_write = remaining;
-
-		// Assume file size is in direct pointers bound
-		assert(block_index < DIRECT_PTRS_COUNT);
-
-		int data_block_num = finode.directs[block_index];
-
-		if (data_block_num < 0) {
-			// Allocate new data block
-			data_block_num = get_avail_blkno();
-
-			if (data_block_num < 0) return -ENOSPC;
-
-			finode.directs[block_index] = data_block_num;
-		}
-
-		if (to_write == BLOCK_SIZE) {
-			// rewrite the whole block
-			// Copy data from buffer to block buffer
-			memcpy(block_buffer, buffer + bytes_written, to_write);
-			
-			// TODO: is there a way to just use the buffer?
-			block_write(data_block_num, block_buffer);
-		} else {
-			// partial write
-			block_read(data_block_num, block_buffer);
-
-			memcpy((char*)block_buffer + block_offset, buffer + bytes_written, to_write);
-
-			block_write(data_block_num, block_buffer);
-		}
-
-		bytes_written += to_write;
-		current_offset += to_write;
-		remaining -= to_write;
-	}
-
-	// Update file size in inode
-	if (offset + bytes_written > finode.size) {
-		finode.size = offset + bytes_written;
-	}
-
-	// Update time
-	finode.mtime = now();
-
-	if (write_inode(finode.ino, &finode) < 0) {
-		perror("write_inode");
-
-		return -1;
-	}
-
-	free(block_buffer);
-
-	printf("\tBytes written: %zu\n", bytes_written);
+	printf("\tByte written: %zu\n", res);
 
 	printf("[myfs_write] Done.\n\n");
 
-	return bytes_written;
+	return res;
 }
 
 static off_t myfs_lseek(const char* path, off_t off, int whence, struct fuse_file_info *fi) {
@@ -1976,8 +2140,8 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 			return -1;
 		}
 
-		free(base);
-		free(dir);
+		// free(base);
+		// free(dir);
 
 		return 0;
 	}
@@ -2034,8 +2198,8 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		return -1;
 	}
 
-	free(base);
-	free(dir);
+	// free(base);
+	// free(dir);
 
 	return 0;
 }
@@ -2375,7 +2539,7 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 		return -1;
 	}
 
-	printf("\tRead inode with ino: %ld\n", fi->fh - 1);
+	printf("\tRead inode with ino: %ld | actual: %ld\n", fi->fh - 1, finode.ino);
 
 	// Update open count
 	finode.open_count--;
