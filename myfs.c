@@ -1,4 +1,5 @@
 #define FUSE_USE_VERSION 30
+#define _GNU_SOURCE
 
 #include <fuse3/fuse.h>
 #include <stdlib.h>
@@ -20,6 +21,16 @@
 
 #include "block.h"
 #include "myfs.h"
+
+#define HAVE_UTIMESAT
+
+#define ARRAY_FILL(arr, value, len) \
+	for (size_t i = 0; i < len; ++i) \
+		(arr)[i] = (value)
+
+#define PERM_CAN_READ(perm) (perm & 4)
+#define PERM_CAN_WRITE(perm) (perm & 2)
+#define PERM_CAN_EXECUTE(perm) (perm & 1)
 
 char diskfile_path[PATH_MAX];
 
@@ -133,7 +144,7 @@ int get_avail_blkno() {
 
 	assert(num_bits_per_blocks > 0);
 
-	printf("\tReading %d blocks (%d bits) of inode bitmap\n", data_bitmap_blocks, num_bits_per_blocks);
+	printf("\tReading %d blocks (%d bits) of data bitmap\n", data_bitmap_blocks, num_bits_per_blocks);
 
 	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
 
@@ -265,6 +276,18 @@ int reset_data_block(int data_block) {
 	return 0;
 }
 
+mode_t get_user_perm(mode_t mode) {
+	return (mode >> 6) & 7;
+}
+
+mode_t get_group_perm(mode_t mode) {
+	return (mode >> 3) & 7;
+}
+
+mode_t get_other_perm(mode_t mode) {
+	return mode & 7;
+}
+
 /**
  * Read inode info given inode number
  */
@@ -275,8 +298,9 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	assert(superblock != NULL);
 	assert(ino < superblock->max_inum);
 
-	uint32_t block_index = ino / BLOCK_SIZE;
-	uint32_t inode_index = ino % BLOCK_SIZE;
+	uint32_t inodes_per_block = BLOCK_SIZE / sizeof(struct inode);
+	uint32_t block_index = ino / inodes_per_block;
+	uint32_t inode_index = ino % inodes_per_block;
 	uint32_t offset = superblock->i_start_blk;
 
 	printf("\tRead from block %d at index %d, offset: %d\n", block_index + offset, inode_index, offset);
@@ -301,6 +325,8 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	
 	free(inode_table);
 
+	printf("\tRead from inode table of ino: %d\n", inode->ino);
+
 	printf("[read_inode] Done.\n\n");
 
 	return 0;
@@ -316,8 +342,9 @@ int write_inode(uint16_t ino, struct inode* inode) {
 	assert(superblock != NULL);
 	assert(ino < superblock->max_inum);
 
-	uint32_t block_index = ino / BLOCK_SIZE;
-	uint32_t inode_index = ino % BLOCK_SIZE;
+	uint32_t inodes_per_block = BLOCK_SIZE / sizeof(struct inode);
+	uint32_t block_index = ino / inodes_per_block;
+	uint32_t inode_index = ino % inodes_per_block;
 	uint32_t offset = superblock->i_start_blk;
 	
 	printf("\tRead from block %d at index %d, offset: %d\n", superblock->i_start_blk + block_index, inode_index, offset);
@@ -330,6 +357,8 @@ int write_inode(uint16_t ino, struct inode* inode) {
 		return -1;
 	}
 
+	printf("\tReading block %d\n", block_index + offset);
+
 	if (block_read(block_index + offset, inode_table) < 0) {
 		perror("Cannot read block");
 	
@@ -340,6 +369,8 @@ int write_inode(uint16_t ino, struct inode* inode) {
 
 	memcpy(inode_table + inode_index, inode, sizeof(struct inode));
 
+	printf("\tCopied inode\n");
+
 	if (block_write(block_index + offset, inode_table) < 0) {
 		perror("Cannot write block");
 
@@ -348,7 +379,11 @@ int write_inode(uint16_t ino, struct inode* inode) {
 		return -1;
 	}
 
+	printf("\tWrote block\n");
+	
 	free(inode_table);
+
+	printf("[write_inode] Done.\n\n");
 
 	return 0;
 }
@@ -359,7 +394,7 @@ struct inode make_inode(uint16_t ino, uint16_t container_ino, uint32_t type, mod
 	assert(container_ino < superblock->max_inum);
 	
 	// For now, just accept dir or regular file or symlink
-	assert(type == S_IFDIR || type == __S_IFREG || type == __S_IFLNK);
+	// assert(type == S_IFDIR || type == __S_IFREG || type == __S_IFLNK);
 	assert(nlink >= 0);
 
 	struct inode node;
@@ -379,7 +414,7 @@ struct inode make_inode(uint16_t ino, uint16_t container_ino, uint32_t type, mod
 	node.uid = getuid();
 	node.gid = getgid();
 
-	memset(node.directs, -1, DIRECT_PTRS_COUNT * sizeof(int));
+	ARRAY_FILL(node.directs, -1, DIRECT_PTRS_COUNT);
 	node.indirect_ptr = -1;
 
 	return node;
@@ -782,9 +817,6 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	assert(ino < superblock->max_inum);
 	assert(inode != NULL);
 
-	// If the given path is the root directory, just return it
-	printf("\tIs this root node: %d\n", strcmp(path, "/"));
-
 	if (strcmp(path, "/") == 0) {
 		if (read_inode(ROOT_INO, inode) < 0) {
 			perror("Cannot read inode");
@@ -843,11 +875,401 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	// Copy current inode to output inode
 	memcpy(inode, &current, sizeof(struct inode));
 
-	printf("[ALERT] ino: %d | size = %u\n", inode->ino, inode->size);
-
 	free(path_clone);
 		
 	return 0;
+}
+
+int make_file(const char* path, mode_t mode, struct inode* out_inode) {
+	assert(path != NULL);
+	assert(out_inode != NULL);
+	assert(ROOT_INO >= 0);
+
+	printf("[make_file] path: %s | mode: %o\n", path, mode);
+
+	char* tmp1, *tmp2;
+
+	tmp1 = strdup(path);
+	tmp2 = strdup(path);
+
+	if (tmp1 == NULL || tmp2 == NULL) {
+		perror("Cannot allocate memory");
+
+		if (tmp1) free(tmp1);
+		if (tmp2) free(tmp2);
+
+		return -ENOSPC;
+	}	
+
+	char* base = basename(tmp1);
+	char* dir = dirname(tmp2);
+
+	// if (base == NULL || dir == NULL) {
+	// 	perror("Cannot allocate memory");
+
+	// 	if (base) free(base);
+	// 	if (dir) free(dir);
+
+	// 	return -ENOSPC;
+	// }
+
+	printf("\tDir: %s | Base: %s\n", dir, base);
+
+	// Get parent inode and check if the target file is already exist
+	struct inode parent_inode = { 0 };
+
+	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
+		free(tmp1);
+		free(tmp2);
+		
+		return -ENOENT;
+	}
+
+	if (parent_inode.valid == 0) {
+		free(tmp1);
+		free(tmp2);
+
+		return -ENOENT;
+	}
+
+	// Check if the target file already exists
+	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
+		free(tmp1);
+		free(tmp2);
+
+		return -EEXIST;
+	}
+
+	// Get the next available inode number for this file
+	int ino = get_avail_ino();
+
+	if (ino < 0) {
+		free(tmp1);
+		free(tmp2);
+
+		return -ENOSPC;
+	}
+
+	if (S_ISFIFO(mode)) {
+		*(out_inode) = make_inode(ino, parent_inode.ino, __S_IFIFO, mode, 0);
+	} else if (S_ISREG(mode)) {
+		*(out_inode) = make_inode(ino, parent_inode.ino, __S_IFREG, mode, 0);
+	} else if (S_ISCHR(mode)) {
+		*(out_inode) = make_inode(ino, parent_inode.ino, __S_IFCHR, mode, 0);
+	} else if (S_ISBLK(mode)) {
+		*(out_inode) = make_inode(ino, parent_inode.ino, __S_IFBLK, mode, 0);
+	} else if (S_ISSOCK(mode)) {
+		*(out_inode) = make_inode(ino, parent_inode.ino, __S_IFSOCK, mode, 0);
+	} else {
+		return -EOPNOTSUPP;
+	}
+
+	// Update open count
+	out_inode->open_count++;
+
+	if (write_inode(ino, out_inode) < 0) {
+		perror("Cannot write inode");
+
+		free(tmp1);
+		free(tmp2);
+
+		return -1;
+	}
+
+	printf("\tWrote file inode ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+
+	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
+		perror("Cannot add dirent entry");
+
+		free(tmp1);
+		free(tmp2);
+
+		return -1;
+	}
+
+	printf("\tAdded file entry ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+
+	free(tmp1);
+	free(tmp2);
+	
+	printf("[make_file] Done.\n\n");
+
+	return 0;
+}
+
+int file_write(struct inode* finode, const char* buffer, size_t size, off_t offset) {
+	printf("[file_write] Ino: %d | size: %zu | offset: %u\n", finode->ino, size, offset);
+
+	if (finode->type == S_IFDIR) {
+		return -EISDIR;
+	} 
+
+	if (finode->valid == 0) {
+		return -1;
+	}
+
+	size_t bytes_written = 0;
+	off_t current_offset = offset;
+	size_t remaining = size;
+	
+	size_t block_index, block_offset, to_write;
+	int writing_blk_num = -1;
+
+	void* block_buffer = malloc(BLOCK_SIZE);
+
+	if (block_buffer == NULL) {
+		return -ENOSPC;
+	}
+
+	while (remaining > 0) {
+		block_index = current_offset / BLOCK_SIZE;
+		block_offset = current_offset % BLOCK_SIZE;
+		to_write = BLOCK_SIZE - block_offset;
+
+		if (to_write > remaining) to_write = remaining;
+
+		if (block_index < DIRECT_PTRS_COUNT) {
+			printf("\tData block inside direct ptrs\n");
+
+			writing_blk_num = finode->directs[block_index];
+			
+			if (writing_blk_num < 0) {
+				printf("\tWriting blk num unallocated\n");
+
+				// Allocate new data block
+				writing_blk_num = get_avail_blkno();
+	
+				if (writing_blk_num < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+	
+				finode->directs[block_index] = writing_blk_num;
+
+				printf("\tAssigned block %d (th)\n", writing_blk_num);
+			}
+		} else {
+			printf("\tData block in indirect ptr region\n");
+
+			// In indirect region
+			int blk_idx = block_index - DIRECT_PTRS_COUNT;
+			int num_blks_indirect = BLOCK_SIZE / sizeof(int);
+
+			assert(blk_idx < num_blks_indirect);
+
+			printf("\tBlk idx: %d | num_blks_indirects: %d\n", blk_idx, num_blks_indirect);
+
+			if (finode->indirect_ptr < 0) {
+				printf("\tIndirect ptr unallocated\n");
+
+				// Allocate
+				int blk = get_avail_blkno();
+				
+				if (blk < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+
+				printf("\tAssigned block: %d to indirect ptr\n", blk);
+
+				// Initialize
+				int* init_buffer = (int*)malloc(BLOCK_SIZE);
+
+				if (init_buffer == NULL) {
+					return bytes_written == 0 ? -ENOSPC : bytes_written; 
+				}
+
+				// Do not use memset as it will set every individual byte to 1
+				// So the next time to read the array as an integer array
+				// C will group every 4 bytes to read an int, 0x01010101 is NOT -1
+				ARRAY_FILL(init_buffer, -1, num_blks_indirect);
+			
+				if (block_write(blk, init_buffer) < 0) {
+					free(block_buffer);
+
+					return bytes_written == 0 ? -1 : bytes_written;  
+				}
+
+				finode->indirect_ptr = blk;
+
+				free(init_buffer);
+			}
+
+			// Read indirect data block
+			int* indirect_buffer = (int*)malloc(BLOCK_SIZE);
+
+			if (indirect_buffer == NULL) {
+				free(block_buffer);
+
+				return bytes_written == 0 ? -ENOSPC : bytes_written;
+			}
+
+			if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
+				free(block_buffer);
+
+				return bytes_written == 0 ? -1 : bytes_written;
+			}
+
+			if (indirect_buffer[blk_idx] == -1) {
+				// Allocate
+				writing_blk_num = get_avail_blkno();
+
+				printf("\tAllocate block %d of blk_idx %d\n", writing_blk_num, blk_idx);
+
+				if (writing_blk_num < 0) {
+					free(block_buffer);
+
+					free(indirect_buffer);
+
+					return bytes_written == 0 ? -ENOSPC : bytes_written;
+				}
+
+				indirect_buffer[blk_idx] = writing_blk_num;
+			}
+		}
+
+		assert(writing_blk_num != -1);
+
+		printf("\tRead from block: %d\n", writing_blk_num);
+
+		if (block_read(writing_blk_num, block_buffer) < 0) {
+			free(block_buffer);
+
+			return bytes_written == 0 ? -1 : bytes_written;
+		}
+
+		if (to_write == BLOCK_SIZE) {
+			// rewrite the whole block
+			memcpy(block_buffer, buffer + bytes_written, to_write);
+		} else {
+			memcpy((char*)block_buffer + block_offset, buffer + bytes_written, to_write);
+		}
+
+		if (block_write(writing_blk_num, block_buffer) < 0) {
+			free(block_buffer);
+
+			return bytes_written == 0 ? -1 : bytes_written;
+		}
+
+		printf("\tWrite to block: %d\n", writing_blk_num);
+
+		bytes_written += to_write;
+		current_offset += to_write;
+		remaining -= to_write;
+	}
+
+	// Update file size in inode
+	if (offset + bytes_written > finode->size) {
+		finode->size = offset + bytes_written;
+	}
+
+	// Update time
+	finode->mtime = now();
+
+	if (write_inode(finode->ino, finode) < 0) {
+		perror("write_inode");
+
+		return bytes_written == 0 ? -1 : bytes_written;
+	}
+
+	free(block_buffer);
+
+	printf("[file_write] Done.\n\n");
+
+	return bytes_written;
+}
+
+int file_read(struct inode* finode, const char* buffer, size_t size, off_t offset) {
+	if (finode->type == S_IFDIR) {
+		return -EISDIR;
+	}
+
+	if (finode->valid == 0) {
+		return -1;
+	}
+
+	size_t bytes_read = 0;
+	off_t current_offset = offset;
+	size_t remaining = size;
+	
+	size_t block_index, block_offset, to_read;
+	int reading_blk_num = -1;
+
+	void* block_buffer = malloc(BLOCK_SIZE);
+
+	if (block_buffer == NULL) {
+		return -ENOSPC;
+	}
+
+	while (remaining > 0) {
+		block_index = current_offset / BLOCK_SIZE;
+		block_offset = current_offset % BLOCK_SIZE;
+		to_read = BLOCK_SIZE - block_offset;
+
+		if (to_read > remaining) to_read = remaining;
+
+		if (block_index < DIRECT_PTRS_COUNT) {
+			reading_blk_num = finode->directs[block_index];
+		} else {
+			// In indirect region
+			int blk_idx = block_index - DIRECT_PTRS_COUNT;
+			int num_blks_indirect = BLOCK_SIZE / sizeof(int);
+
+			assert(blk_idx < num_blks_indirect);
+
+			if (finode->indirect_ptr >= 0) {
+				// Read indirect data block
+				int* indirect_buffer = (int*)malloc(BLOCK_SIZE);
+
+				if (indirect_buffer == NULL) {
+					free(block_buffer);
+
+					return bytes_read == 0 ? -ENOSPC : bytes_read;
+				}
+
+				if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
+					free(block_buffer);
+	
+					return bytes_read == 0 ? -1 : bytes_read;
+				}
+
+				reading_blk_num = indirect_buffer[blk_idx];
+			}
+		}
+
+		if (reading_blk_num < 0) {
+			// Hole or unallocate data region
+			// return 0
+			memset(buffer + bytes_read, 0, to_read);
+		} else {
+			if (block_read(reading_blk_num, block_buffer) < 0) {
+				free(block_buffer);
+	
+				return bytes_read == 0 ? -1 : bytes_read;
+			}
+
+			memcpy(buffer + bytes_read, (char*)block_buffer + block_offset, to_read);
+		}
+
+		bytes_read += to_read;
+		current_offset += to_read;
+		remaining -= to_read;
+	}
+
+	// Update time
+	finode->atime = now();
+
+	if (write_inode(finode->ino, finode) < 0) {
+		perror("write_inode");
+
+		return bytes_read == 0 ? -1 : bytes_read;
+	}
+
+	free(block_buffer);
+
+	return bytes_read;
 }
 
 int init_superblock() {	
@@ -858,7 +1280,7 @@ int init_superblock() {
 	// STORATE FILE FORMAT:
 	// | superblock | inode bitmap | data bitmap | inode | data |
 	
-	superblock = (struct superblock*)malloc(sizeof(struct superblock));
+	superblock = (struct superblock*)malloc(BLOCK_SIZE);
 
 	if (superblock == NULL) {
 		perror("Cannot allocate memory");
@@ -944,7 +1366,7 @@ int init_inode_bitmap() {
 
 	assert(inode_bitmap_blocks >= 1);
 
-	printf("\tSaving bitmap to %d blocks\n", inode_bitmap_blocks);
+	printf("\tSaving bitmap to %d blocks start from %u (th) block to %u (th) block\n", inode_bitmap_blocks, superblock->i_bitmap_blk, superblock->d_bitmap_blk - 1);
 
 	void* buffer = malloc(BLOCK_SIZE);
 
@@ -987,7 +1409,7 @@ int init_data_bitmap() {
 
 	assert(data_bitmap_blocks >= 1);
 
-	printf("\tSaving bitmap to %d blocks\n", data_bitmap_blocks);
+	printf("\tSaving bitmap to %d blocks start from %u (th) block to %u (th) block\n", data_bitmap_blocks, superblock->d_bitmap_blk, superblock->i_start_blk - 1);
 
 	void* buffer = malloc(BLOCK_SIZE);
 
@@ -1034,6 +1456,8 @@ int init_inode_region() {
 
 	assert(inode_blocks >= 1);
 
+	printf("\tSaving inode region to %d blocks start from %u (th) block to %u (th) block\n", inode_blocks, superblock->i_start_blk, superblock->d_start_blk - 1);
+
 	void* buffer = malloc(BLOCK_SIZE);
 
 	if (buffer == NULL) {
@@ -1068,7 +1492,7 @@ int init_inode_region() {
 		return -1;
 	}
 
-	struct inode root_inode = make_inode(ROOT_INO, ROOT_INO, S_IFDIR, 0755, 0);
+	struct inode root_inode = make_inode(ROOT_INO, ROOT_INO, S_IFDIR, 0777, 0);
 
 	if (write_inode(ROOT_INO, &root_inode) < 0) {
 		perror("Cannot write inode");
@@ -1091,8 +1515,6 @@ int init_inode_region() {
 	struct inode test_root_inode = { 0 };
 	
 	read_inode(ROOT_INO, &test_root_inode);
-
-	printf("[ROOT ALERT] size = %u\n", test_root_inode.size);
 
 	free(buffer);
 
@@ -1241,23 +1663,34 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	if (uid == dir_inode.uid) {
 		// User is the owner of the file
 		// Extract user-permission region (the first 3 bits)
-		perm = (dir_inode.mode >> 6) & 7;
+
+		printf("\tuser open dir\n");
+
+		perm = get_user_perm(dir_inode.mode);
 	} else if (gid == dir_inode.gid) {
 		// User is in a group that owns this file
 		// Extract group-permission region (the next 3 bits)
-		perm = (dir_inode.mode >> 3) & 7;
+
+		printf("\tgroup open dir\n");
+
+		perm = get_group_perm(dir_inode.mode);
 	} else {
 		// Means others
 		// Extract the last 3 bits
-		perm = dir_inode.mode & 7;
+
+		printf("\tothers open dir\n");
+
+		perm = get_other_perm(dir_inode.mode);
 	}
 
+	printf("\tCan read: %d | Can write: %d\n", PERM_CAN_READ(perm), PERM_CAN_WRITE(perm));
+
 	// Check permission bit
-	if (need_read && (perm & 4) == 0) {
+	if (need_read && !PERM_CAN_READ(perm)) {
 		return -EACCES;
 	}
 
-	if (need_write && (perm & 2) == 0) {
+	if (need_write && !PERM_CAN_WRITE(perm)) {
 		return -EACCES;
 	}
 
@@ -1386,20 +1819,17 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return -ENOSPC;
 	}
 
-	char *dir = strdup(dirname(tmp1));
-	char *base = strdup(basename(tmp2));
+	char *dir = dirname(tmp1);
+	char *base = basename(tmp2);
 
-	free(tmp1);
-	free(tmp2);
+	// if (dir == NULL || base == NULL) {
+	// 	perror("Unable to extract base or dir name due to space");
 
-	if (dir == NULL || base == NULL) {
-		perror("Unable to extract base or dir name due to space");
+	// 	if (dir) free(dir);
+	// 	if (base) free(base);
 
-		if (dir) free(dir);
-		if (base) free(base);
-
-		return -ENOSPC;
-	}
+	// 	return -ENOSPC;
+	// }
 
 	printf("\tDir %s | Base: %s\n", dir, base);
 
@@ -1410,16 +1840,16 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	}
 
 	if (parent_inode.valid == 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOENT;
 	}
 	
 	// Check if the target directory already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -EEXIST;
 	}
@@ -1428,8 +1858,8 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	int ino = get_avail_ino();
 
 	if (ino < 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOSPC;
 	}
@@ -1439,8 +1869,8 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	if (write_inode(ino, &new_dir_inode) < 0) {
 		perror("Cannot write inode");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
@@ -1471,8 +1901,8 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 
 	printf("\tWrote dir entry to parent dir inode\n");
 	
-	free(dir);
-	free(base);
+	free(tmp1);
+	free(tmp2);
 
 	printf("[myfs_mkdir] Done.\n\n");
 
@@ -1483,105 +1913,15 @@ static int myfs_create(const char* path, mode_t mode, struct fuse_file_info* fi)
 	printf("[myfs_create] path: %s | mode: %o\n", path, mode);
 
 	assert(path != NULL);
-	assert(ROOT_INO >= 0);
 
-	char *tmp1, *tmp2;
+	struct inode file_inode = { 0 };
 
-	tmp1 = strdup(path);
-	tmp2 = strdup(path);
+	int res = make_file(path, mode, &file_inode);
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		perror("Cannot allocate memory");
-
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-
-		return -ENOSPC;
-	}	
-
-	char* base = basename(strdup(tmp1));
-	char* dir = dirname(strdup(tmp2));
-	
-	free(tmp1);
-	free(tmp2);
-
-	if (base == NULL || dir == NULL) {
-		perror("Cannot allocate memory");
-
-		if (base) free(base);
-		if (dir) free(dir);
-
-		return -ENOSPC;
-	}
-
-	printf("\tDir: %s | Base: %s\n", dir, base);
-	
-	// Get parent inode and check if the target file is already exist
-	struct inode parent_inode = { 0 };
-
-	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
-		free(base);
-		free(dir);
-		
-		return -ENOENT;
-	}
-
-	if (parent_inode.valid == 0) {
-		free(base);
-		free(dir);
-
-		return -ENOENT;
-	}
-
-	printf("\t[ALERT] parent ino: %d | size = %u\n", parent_inode.ino, parent_inode.size);
-
-	// Check if the target file already exists
-	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(base);
-		free(dir);
-
-		return -EEXIST;
-	}
-
-	// Get the next available inode number for this file
-	int ino = get_avail_ino();
-
-	if (ino < 0) {
-		free(base);
-		free(dir);
-
-		return -ENOSPC;
-	}
-
-	struct inode new_file_inode = make_inode(ino, parent_inode.ino, __S_IFREG, mode, 0);
-
-	// Update open count
-	new_file_inode.open_count++;
-
-	if (write_inode(ino, &new_file_inode) < 0) {
-		perror("Cannot write inode");
-
-		free(base);
-		free(dir);
-
-		return -1;
-	}
-
-	printf("\tWrote file inode ino: %d to parent ino: %d\n", ino, parent_inode.ino);
-
-	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
-		perror("Cannot add dirent entry");
-
-		free(base);
-		free(dir);
-
-		return -1;
-	}
-
-	printf("\tAdded file entry ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+	if (res < 0) return res;
 	
 	// Save inode into cache for later use
-	fi->fh = (uint64_t)ino + 1;
+	fi->fh = (uint64_t)file_inode.ino + 1;
 
 	printf("[myfs_create] Done.\n\n");
 	
@@ -1695,63 +2035,19 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 		return -ENOENT;
 	}
 
-	if (offset >= finode.size) {
-		// offset is beyond file size
-		return 0;
-	}	
-
-	if (size + offset > finode.size) {
-		// cap size
-		size = finode.size - offset;
-	}
-
 	printf("\tReading file (%zu) of size: %u | offset: %ld\n", finode.size, size, offset);
 
-	size_t bytes_read = 0;
-	off_t current_offset = offset;
-	size_t remaining = size;
-	
-	void* block = malloc(BLOCK_SIZE);
+	int res;
 
-	if (block == NULL) {
-		perror("Cannot allocate memory");
-
-		return -ENOSPC;
+	if ((res = file_read(&finode, buffer, size, offset)) < 0) {
+		return res;
 	}
 
-	while (remaining > 0) {
-		size_t block_index = current_offset / BLOCK_SIZE;
-		size_t block_offset = current_offset % BLOCK_SIZE;
-		size_t to_read = BLOCK_SIZE - block_offset;
-
-		if (to_read > remaining) to_read = remaining;
-
-		// Assume we only use direct ptr firstly
-		assert(block_index < DIRECT_PTRS_COUNT);
-
-		int data_block_num = finode.directs[block_index];
-
-		if (data_block_num < 0) {
-			// not allocated
-			memset(buffer + bytes_read, 0, to_read);
-		} else {
-			block_read(data_block_num, block);
-
-			memcpy(buffer + bytes_read, (char*)block + block_offset, to_read);
-		}
-
-		bytes_read += to_read;
-		current_offset += to_read;
-		remaining -= to_read;
-	}
-
-	free(block);
-
-	printf("\tBytes read: %zu\n", bytes_read);
+	printf("\tBytes read: %zu\n", res);
 
 	printf("[myfs_read] Done.\n\n");
 
-	return bytes_read;
+	return res;
 }
 
 static int myfs_write(const char* path, const char* buffer, size_t size, off_t offset, struct fuse_file_info* fi) {
@@ -1775,7 +2071,7 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		return -1;
 	}
 
-	printf("\tRead inode with ino: %ld\n", fi->fh - 1);
+	printf("\tRead inode with ino: %ld | actual: %d\n", fi->fh - 1, finode.ino);
 
 	if (finode.type != __S_IFREG) {
 		perror("Not a file");
@@ -1789,83 +2085,17 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 		return -ENOENT;
 	}
 
-	size_t bytes_written = 0;
-	off_t current_offset = offset;
-	size_t remaining = size;
-	
-	void* block_buffer = malloc(BLOCK_SIZE);
-	
-	if (block_buffer == NULL) {
-		perror("Cannot allocate memory");
+	int res = 0;
 
-		return -ENOSPC;
+	if ((res = file_write(&finode, buffer, size, (fi->flags & O_APPEND != 0) ? finode.size : offset)) < 0) {
+		return res;
 	}
 
-	// TODO: handle case when offset is beyond file size
-	// the portion from the last byte to offset should be allocated and then write
-	while (remaining > 0) {
-		size_t block_index = current_offset / BLOCK_SIZE;
-		size_t block_offset = current_offset % BLOCK_SIZE;
-		size_t to_write = BLOCK_SIZE - block_offset;
-
-		if (to_write > remaining) to_write = remaining;
-
-		// Assume file size is in direct pointers bound
-		assert(block_index < DIRECT_PTRS_COUNT);
-
-		int data_block_num = finode.directs[block_index];
-
-		if (data_block_num < 0) {
-			// Allocate new data block
-			data_block_num = get_avail_blkno();
-
-			if (data_block_num < 0) return -ENOSPC;
-
-			finode.directs[block_index] = data_block_num;
-		}
-
-		if (to_write == BLOCK_SIZE) {
-			// rewrite the whole block
-			// Copy data from buffer to block buffer
-			memcpy(block_buffer, buffer + bytes_written, to_write);
-			
-			// TODO: is there a way to just use the buffer?
-			block_write(data_block_num, block_buffer);
-		} else {
-			// partial write
-			block_read(data_block_num, block_buffer);
-
-			memcpy((char*)block_buffer + block_offset, buffer + bytes_written, to_write);
-
-			block_write(data_block_num, block_buffer);
-		}
-
-		bytes_written += to_write;
-		current_offset += to_write;
-		remaining -= to_write;
-	}
-
-	// Update file size in inode
-	if (offset + bytes_written > finode.size) {
-		finode.size = offset + bytes_written;
-	}
-
-	// Update time
-	finode.mtime = now();
-
-	if (write_inode(finode.ino, &finode) < 0) {
-		perror("write_inode");
-
-		return -1;
-	}
-
-	free(block_buffer);
-
-	printf("\tBytes written: %zu\n", bytes_written);
+	printf("\tByte written: %zu\n", res);
 
 	printf("[myfs_write] Done.\n\n");
 
-	return bytes_written;
+	return res;
 }
 
 static off_t myfs_lseek(const char* path, off_t off, int whence, struct fuse_file_info *fi) {
@@ -1912,26 +2142,23 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		return -ENOSPC;
 	}
 
-	char* base = basename(strdup(tmp1));
-	char* dir = dirname(strdup(tmp2));
+	char* base = basename(tmp1);
+	char* dir = dirname(tmp2);
 
-	free(tmp1);
-	free(tmp2);
+	// if (base == NULL || dir == NULL) {
+	// 	perror("Cannot allocate memory");
 
-	if (base == NULL || dir == NULL) {
-		perror("Cannot allocate memory");
+	// 	if (base) free(base);
+	// 	if (dir) free(dir);
 
-		if (base) free(base);
-		if (dir) free(dir);
-
-		return -ENOSPC;
-	}
+	// 	return -ENOSPC;
+	// }
 
 	if (strcmp(base, "") == 0) {
 		perror("Cannot rename - target has no specified name");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
@@ -1950,8 +2177,8 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		struct inode dir_inode = { 0 };
 
 		if (get_node_by_path(dir, ROOT_INO, &dir_inode) < 0) {
-			free(base);
-			free(dir);
+			free(tmp1);
+			free(tmp2);
 			
 			return -ENOENT;
 		}
@@ -1960,8 +2187,8 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		if (dir_remove(&old_dir, &old) < 0) {
 			perror("Cannot remove entry");
 
-			free(base);
-			free(dir);
+			free(tmp1);
+			free(tmp2);
 
 			return -1;
 		}
@@ -1970,14 +2197,14 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		if (dir_add(&dir_inode, old.ino, base, strlen(base)) < 0) {
 			perror("Cannot add new entry");
 
-			free(base);
-			free(dir);
+			free(tmp1);
+			free(tmp2);
 
 			return -1;
 		}
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return 0;
 	}
@@ -1990,8 +2217,8 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 	if ((old.type == S_IFDIR && new.type != S_IFDIR) || (old.type != S_IFDIR && new.type == S_IFDIR)) {
 		perror("Cannot rename from a directory to a non-directory entity");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -EISDIR;
 	}
@@ -2001,6 +2228,9 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 	if (read_inode(new.container_ino, &new_dir) < 0) {
 		perror("Cannot read inode");
 
+		free(tmp1);
+		free(tmp2);
+
 		return -ENOENT;
 	}
 
@@ -2008,18 +2238,18 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 	if (dir_remove(&new_dir, &new) < 0) {
 		perror("Cannot remove entry");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 		
 		return -1;
 	}
 
 	// Create new now point to old's inode but in new's dir
-	if (dir_add(new.container_ino, old.ino, base, strlen(base)) < 0) {
+	if (dir_add(&new_dir, old.ino, base, strlen(base)) < 0) {
 		perror("Cannot add entry");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
@@ -2028,14 +2258,14 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 	if (dir_remove(&old_dir, &old) < 0) {
 		perror("Cannot remove entry");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
 
-	free(base);
-	free(dir);
+	free(tmp1);
+	free(tmp2);
 
 	return 0;
 }
@@ -2223,19 +2453,20 @@ static int myfs_unlink(const char* path) {
 static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi) {
 	assert(path != NULL);
 	assert(size >= 0);
+	assert(ROOT_INO != -1);
 	
 	printf("[myfs_truncate] path: %s | size: %ld\n", path, size);
 
-	if (fi->fh == 0) {
-		perror("Call open() before this operation");
-		
-		return -1;
-	}
-
 	struct inode f_inode = { 0 };
 
-	if (read_inode(fi->fh - 1, &f_inode) == -1) {
-		return -ENOENT;
+	if (fi != NULL && fi->fh != 0) {
+		if (read_inode(fi->fh - 1, &f_inode) == -1) {
+			return -ENOENT;
+		}
+	} else {
+		if (get_node_by_path(path, ROOT_INO, &f_inode) < 0) {
+			return -ENOENT;
+		}
 	}
 
 	if (f_inode.type == S_IFDIR) {
@@ -2285,46 +2516,90 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 	int req_blk_idx = size / BLOCK_SIZE;
 	int req_blk_offset = size % BLOCK_SIZE;
 
-	assert(f_inode.directs[req_blk_idx] >= 0);
+	printf("\tRequested Block Index: %d | Offset: %d\n", req_blk_idx, req_blk_offset);
 
-	printf("\tReq Blk Idx: %d | Req Blk Offset: %d\n", req_blk_idx, req_blk_offset);
+	int truncated_block_num = -1;
 
-	// Remove all blocks beyond req_blk_idx
-	for (int i = req_blk_idx + 1; i < DIRECT_PTRS_COUNT; ++i) {
-		if (f_inode.directs[i] < 0) continue;
+	if (req_blk_idx >= DIRECT_PTRS_COUNT) {
+		// In indirect region
+		if (f_inode.indirect_ptr >= 0) {
+			int num_datablk_per_indirect = BLOCK_SIZE / sizeof(int);
 
-		if (reset_data_block(f_inode.directs[i]) < 0) {
-			perror("Cannot reset data block");
+			int req_indirect_idx = req_blk_idx - DIRECT_PTRS_COUNT;
+
+			assert(req_indirect_idx < num_datablk_per_indirect);
+
+			int* buf = (int*)malloc(BLOCK_SIZE);
+
+			if (buf == NULL) return -ENOSPC;
+
+			if (block_read(f_inode.indirect_ptr, buf) < 0) {
+				free(buf);
+
+				return -1;
+			}
+
+			// Remove all blocks beyond req_indirect_idx
+			for (int i = req_indirect_idx; i < num_datablk_per_indirect; ++i) {
+				if (buf[i] < 0) continue;
+
+				if (reset_data_block(buf[i]) < 0) {
+					perror("Cannot reset data block");
+					
+					free(buf);
+
+					return -1;
+				}
+			}
+
+			free(buf);
+
+			truncated_block_num = req_indirect_idx;
+		}
+	} else {
+		// Remove all blocks beyond req_blk_idx
+		for (int i = req_blk_idx + 1; i < DIRECT_PTRS_COUNT; ++i) {
+			if (f_inode.directs[i] < 0) continue;
+
+			if (reset_data_block(f_inode.directs[i]) < 0) {
+				perror("Cannot reset data block");
+
+				return -1;
+			}
+		}
+
+		truncated_block_num = req_blk_idx;
+	}
+	
+	printf("\tRemoved all blocks after %d\n", req_blk_idx);
+
+	if (truncated_block_num != -1) {
+		// Truncate block req_blk_idx (the rest is filled with zero)
+		void* buffer = malloc(BLOCK_SIZE);
+
+		if (buffer == NULL) {
+			perror("Cannot allocate memory");
 
 			return -1;
 		}
-	}
 
-	printf("\tRemoved all blocks after %d\n", req_blk_idx);
+		if (block_read(f_inode.directs[req_blk_idx], buffer) < 0) {
+			perror("Cannot read block");
 
-	// Truncate block req_blk_idx (the rest is filled with zero)
-	void* buffer = malloc(BLOCK_SIZE);
+			free(buffer);
 
-	if (buffer == NULL) {
-		perror("Cannot allocate memory");
+			return -1;
+		}
 
-		return -1;
-	}
+		memset(buffer + req_blk_offset, 0, BLOCK_SIZE - req_blk_offset);
 
-	if (block_read(f_inode.directs[req_blk_idx], buffer) < 0) {
-		perror("Cannot read block");
+		printf("\tSet to 0 of data block %d from offset %d | size %d\n", f_inode.directs[req_blk_idx], req_blk_offset, BLOCK_SIZE - req_blk_offset);
+
+		if (block_write(f_inode.directs[req_blk_idx], buffer) < 0) {
+			perror("Cannot write block");
+		}
 
 		free(buffer);
-
-		return -1;
-	}
-
-	memset(buffer + req_blk_offset, 0, BLOCK_SIZE - req_blk_offset);
-
-	printf("\tSet to 0 of data block %d from offset %d | size %d\n", f_inode.directs[req_blk_idx], req_blk_offset, BLOCK_SIZE - req_blk_offset);
-
-	if (block_write(f_inode.directs[req_blk_idx], buffer) < 0) {
-		perror("Cannot write block");
 	}
 
 	// Update size
@@ -2375,7 +2650,7 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 		return -1;
 	}
 
-	printf("\tRead inode with ino: %ld\n", fi->fh - 1);
+	printf("\tRead inode with ino: %ld | actual: %ld\n", fi->fh - 1, finode.ino);
 
 	// Update open count
 	finode.open_count--;
@@ -2493,20 +2768,17 @@ static int myfs_symlink(const char* target, const char* link) {
 		return -ENOSPC;
 	}
 
-	char *base = basename(strdup(tmp1));
-	char *dir = dirname(strdup(tmp2));
+	char *base = basename(tmp1);
+	char *dir = dirname(tmp2);
 
-	free(tmp1);
-	free(tmp2);
+	// if (base == NULL || dir == NULL) {
+	// 	perror("Cannot allocate memory");
 
-	if (base == NULL || dir == NULL) {
-		perror("Cannot allocate memory");
+	// 	if (base) free(base);
+	// 	if (dir) free(dir);
 
-		if (base) free(base);
-		if (dir) free(dir);
-
-		return -ENOSPC;
-	}
+	// 	return -ENOSPC;
+	// }
 
 	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
 
@@ -2514,23 +2786,23 @@ static int myfs_symlink(const char* target, const char* link) {
 	struct inode parent_inode = { 0 };
 
 	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 		
 		return -ENOENT;
 	}
 
 	if (parent_inode.valid == 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOENT;
 	}
 
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -EEXIST;
 	}
@@ -2539,8 +2811,8 @@ static int myfs_symlink(const char* target, const char* link) {
 	int ino = get_avail_ino();
 
 	if (ino < 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOSPC;
 	}
@@ -2550,8 +2822,8 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (write_inode(ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
@@ -2561,8 +2833,8 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
 		perror("Cannot add dirent entry");
 
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -1;
 	}
@@ -2596,6 +2868,9 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (write_inode(new_file_inode.ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
 
+		free(tmp1);
+		free(tmp2);
+
 		return -1;
 	}
 
@@ -2605,6 +2880,9 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (buffer == NULL) {
 		perror("Cannot allocate memory");
 
+		free(tmp1);
+		free(tmp2);
+
 		return -ENOSPC;
 	}
 
@@ -2612,7 +2890,9 @@ static int myfs_symlink(const char* target, const char* link) {
 
 	if (block_write(blk_idx, buffer) < 0) {
 		perror("Cannot write block");
-
+		
+		free(tmp1);
+		free(tmp2);
 		free(buffer);
 
 		return -1;
@@ -2620,6 +2900,8 @@ static int myfs_symlink(const char* target, const char* link) {
 
 	printf("\tWrote path to file\n");
 
+	free(tmp1);
+	free(tmp2);
 	free(buffer);
 
 	printf("[myfs_symlink] Done.\n\n");
@@ -2648,35 +2930,32 @@ static int myfs_link(const char* target, const char* link) {
 		return -ENOSPC;
 	}
 
-	char *base = basename(strdup(tmp1));
-	char *dir = dirname(strdup(tmp2));
+	char *base = basename(tmp1);
+	char *dir = dirname(tmp2);
 
-	free(tmp1);
-	free(tmp2);
+	// if (base == NULL || dir == NULL) {
+	// 	perror("Cannot allocate memory");
 
-	if (base == NULL || dir == NULL) {
-		perror("Cannot allocate memory");
+	// 	if (base) free(base);
+	// 	if (dir) free(dir);
 
-		if (base) free(base);
-		if (dir) free(dir);
-
-		return -ENOSPC;
-	}
+	// 	return -ENOSPC;
+	// }
 
 	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
 
 	struct inode parent_inode = { 0 };
 
 	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOENT;
 	}
 
 	if (parent_inode.valid == 0) {
-		free(base);
-		free(dir);
+		free(tmp1);
+		free(tmp2);
 
 		return -ENOENT;
 	}
@@ -2684,17 +2963,23 @@ static int myfs_link(const char* target, const char* link) {
 	struct inode target_inode = { 0 };
 
 	if (get_node_by_path(target, ROOT_INO, &target_inode) < 0) {
+		free(tmp1);
+		free(tmp2);
+
 		return -ENOENT;
 	}
 
 	if (dir_add(&parent_inode, target_inode.ino, base, strlen(base)) < 0) {
 		perror("Cannot add entry to directory");
 
+		free(tmp1);
+		free(tmp2);
+
 		return -1;
 	}
 
-	// free(base);
-	// free(dir);
+	free(tmp1);
+	free(tmp2);
 
 	printf("[myfs_link] Done.\n\n");
 
@@ -2727,14 +3012,206 @@ static int myfs_readlink(const char* link, char* buffer, size_t len) {
 	if (block_read(link_inode.directs[0], blk_buffer) < 0) {
 		perror("Cannot read block");
 
+		free(blk_buffer);
+
 		return -1;
 	}
 
-	memcpy(buffer, blk_buffer, len);
+	// pray that it has /0
+	size_t path_length = strlen(blk_buffer);
+
+	if (len == 0) return -EINVAL;
+	
+	size_t n = (path_length < len - 1) ? path_length : (len - 1);
+
+	memcpy(buffer, blk_buffer, n);
 
 	free(blk_buffer);
 
 	printf("[myfs_readlink] Done.\n\n");
+
+	return 0;
+}
+
+static int myfs_mknod(const char* path, mode_t mode, dev_t dev) {
+	printf("[myfs_mknod] path: %s\n", path);
+
+	assert(path != NULL);
+
+	struct inode file_inode = { 0 };
+
+	int res = make_file(path, mode, &file_inode);
+
+	if (res < 0) return res;
+	
+	printf("[myfs_mknod] Done.\n\n");
+
+	return 0;
+}
+
+static int myfs_access(const char* path, int mode) {
+	assert(ROOT_INO >= 0);
+	assert(path != NULL);
+
+	printf("[myfs_access] path: %s\n", path);
+
+	struct inode item = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &item) < 0) {
+		return -ENOENT;
+	}
+
+	if (item.valid == 0) {
+		return -ENOENT;
+	}
+
+	printf("\tIno: %d\n", item.ino);
+
+	if (mode == F_OK) {
+		// The user wants to know if the file exists
+		printf("\tRequest file exist granted\n");
+		return 0;
+	}
+
+	// Get user's uid and gid from the context
+	struct fuse_context *ctx = fuse_get_context();
+
+	assert(ctx != NULL);
+
+	uid_t uid = ctx->uid;
+	gid_t gid = ctx->gid;
+
+	printf("\tUser -- uid: %u | gid: %u\n", uid, gid);
+
+	// Extract permissions from inode
+	mode_t perm;
+
+	if (uid == item.uid) {
+		// The user who wants to access this file is the owner of this file
+		perm = get_user_perm(item.mode);
+	} else if (gid == item.gid) {
+		// If the user who wants to access this file is not the owner of this file
+		// but within the group of this file
+		perm = get_group_perm(item.mode);
+	} else {
+		perm = get_other_perm(item.mode);
+	}
+
+	switch (mode)
+	{
+	case R_OK:
+		// Ther user who invokes this want to know if they can read this file
+		if (PERM_CAN_READ(mode)) return 0;
+
+		break;
+	case W_OK:
+		// The user who invokes this want to know if they can write this file
+		if (PERM_CAN_WRITE(perm)) return 0;
+
+		break;
+	case X_OK:
+		// The user who invokes this want to know if they can execute this file
+		if (PERM_CAN_EXECUTE(perm)) return 0;
+		break;
+	default:
+		break;
+	}
+
+	return -EACCES;
+}
+
+static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) {
+	assert(path != NULL);
+	assert(ROOT_INO != -1);
+	
+	printf("[myfs_chmod] path: %s\n", path);
+
+	struct fuse_context* ctx = fuse_get_context();
+	
+	assert(ctx != NULL);
+
+	uid_t uid = ctx->uid;
+
+	struct inode item = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &item) < 0) {
+		return -ENOENT;
+	}
+
+	printf("\tIno: %d\n", item.ino);
+
+	// Check if user is the owner of this file
+	// chmod only when user is the owner of the file or the root user
+	// uid = 0 is the root user
+	if (uid != item.uid || uid != 0) {
+		return -EPERM;
+	}
+
+	item.mode = mode;
+
+	if (write_inode(item.ino, &item) < 0) {
+		return -1;
+	}
+
+	printf("[myfs_chmod] Done.\n\n");
+
+	return 0;
+}
+
+static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_info *fi) {
+	assert(path != NULL);
+	assert(ROOT_INO != -1);
+	
+	printf("[myfs_chown] path: %s\n", path);
+
+	struct fuse_context* ctx = fuse_get_context();
+	
+	assert(ctx != NULL);
+
+	uid_t uuid = ctx->uid;
+
+	struct inode item = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &item) < 0) {
+		return -ENOENT;
+	}
+
+	printf("\tIno: %d\n", item.ino);
+
+	// chown only when user is the root user
+	// uid = 0 is the root user
+	if (uuid != 0) {
+		return -EPERM;
+	}
+
+	item.uid = uid;
+	item.gid = gid;
+
+	if (write_inode(item.ino, &item) < 0) {
+		return -1;
+	}
+
+	printf("[myfs_chown] Done.\n\n");
+
+	return 0;
+}
+
+static int myfs_statfs(const char* path, struct statvfs *stat) {
+	assert(path != NULL);
+	assert(stat != NULL);
+	assert(ROOT_INO != -1);
+
+	printf("[myfs_statfs] path: %s\n", path);
+
+	struct inode item = { 0 };
+
+	if (get_node_by_path(path, ROOT_INO, &item) < 0) {
+		return -ENOENT;
+	}
+
+	stat->f_bsize = BLOCK_SIZE;
+	stat->f_frsize = BLOCK_SIZE;
+	stat->f_blocks = superblock->max_dnum;
 
 	return 0;
 }
@@ -2747,7 +3224,6 @@ static struct fuse_operations myfs_ope = {
 	.readdir = myfs_readdir,
 	.opendir = myfs_opendir,
 	.mkdir = myfs_mkdir,
-
 	.create = myfs_create,
 	.open = myfs_open,
 	.read = myfs_read,
@@ -2763,11 +3239,29 @@ static struct fuse_operations myfs_ope = {
 	.readlink = myfs_readlink,
 	.truncate = myfs_truncate,
 	.flush = myfs_flush,
-	.utimens = myfs_utimens,
 	.release = myfs_release,
 	.fallocate = myfs_fallocate,
+	.flock = myfs_flock,
+	.mknod = myfs_mknod,
+	.access = myfs_access,
+	.chmod = myfs_chmod,
+	.chown = myfs_chown,
+	.statfs = myfs_statfs,
+#ifdef HAVE_UTIMESAT
+	.utimens = myfs_utimens,
+#endif
+#ifdef HAVE_SETXATTR
+	.setxattr	= myfs_setxattr,
+	.getxattr	= myfs_getxattr,
+	.listxattr	= myfs_listxattr,
+	.removexattr	= myfs_removexattr,
+#endif
+#ifdef HAVE_COPY_FILE_RANGE
 	.copy_file_range = myfs_copy_file_range,
-	.flock = myfs_flock
+#endif
+#ifdef HAVE_STATX
+	.statx		= myfs_statx,
+#endif
 };
 
 // Entry point of the library
