@@ -32,6 +32,7 @@
 #define PERM_CAN_READ(perm) (perm & 4)
 #define PERM_CAN_WRITE(perm) (perm & 2)
 #define PERM_CAN_EXECUTE(perm) (perm & 1)
+#define STICKY_MODE(mode) mode & S_ISVTX
 
 char diskfile_path[PATH_MAX];
 
@@ -553,20 +554,22 @@ int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* di
 		for (int j = 0; j < num_entries_per_block; ++j) {
 			// if (total_dirents_read == total_dirents) break;
 
-			printf("\t\tChecking item[%d]: %s at block %d\n", j, buffer[j].name, dir_inode.directs[i]);
-
-			if (buffer[j].valid == 1 && strncmp(buffer[j].name, fname, name_len) == 0) {
-				printf("\t\tFound item\n");
-
-				if (dirent != NULL) {
-					memcpy(dirent, &buffer[j], sizeof(struct dirent));
+			if (buffer[j].valid == 1) {
+				printf("\t\tChecking item[%d]: %s at block %d\n", j, buffer[j].name, dir_inode.directs[i]);
+				
+				if (strncmp(buffer[j].name, fname, name_len) == 0) {
+					printf("\t\tFound item | ino: %d\n", buffer[j].ino);
+	
+					if (dirent != NULL) {
+						memcpy(dirent, &buffer[j], sizeof(struct dirent));
+					}
+	
+					free(buffer);
+	
+					printf("[dir_find] Done.\n\n");
+	
+					return 0;
 				}
-
-				free(buffer);
-
-				printf("[dir_find] Done.\n\n");
-
-				return 0;
 			}
 
 			// total_dirents_read++;
@@ -664,7 +667,7 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 				// Update mtime
 				dir_inode->mtime = now();
 				
-				printf("\tUpdated parent dir size to: %u\n", dir_inode->size);
+				printf("\tUpdated parent dir ino %d size to: %u\n", dir_inode->ino, dir_inode->size);
 
 				// num nlink of dir = 2 + num sub directories
 				if (f_inode.type == S_IFDIR && f_inode.ino != dir_inode->ino) {
@@ -685,6 +688,8 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 				// To prevent dir_add adding itself
 				if (f_ino != dir_inode->ino) {
 					f_inode.nlink++;
+
+					printf("\tUpdated nlink of ino: %d to %d\n", f_inode.ino, f_inode.nlink);
 
 					if (write_inode(f_ino, &f_inode) == -1) {
 						perror("Cannot write inode");
@@ -793,14 +798,14 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 /**
  * Remove an entry from a directory
  */
-int dir_remove(struct inode* dir_inode, struct inode* entry_inode) {
+int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* fname) {
 	assert(superblock != NULL);
 	assert(dir_inode != NULL);
+	assert(fname != NULL);
 	assert(entry_inode != NULL);
-	assert(entry_inode->ino < superblock->max_inum);
 	assert(dir_inode->ino != entry_inode->ino);
-	
-	printf("[dir_remove] parent ino: %d about to remove ino: %d\n", dir_inode->ino, entry_inode->ino);
+
+	printf("[dir_remove] parent ino: %d about to remove (-> ino: %d): %s\n", dir_inode->ino, entry_inode->ino, fname);
 
 	int num_entry = dir_inode->size / sizeof(struct dirent);
 
@@ -833,8 +838,13 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode) {
 
 		for (int j = 0; j < num_entries_per_block; ++j) {
 			// if (entries_read == num_entry) break;
+			if (buffer[j].valid == 1) {
+				printf("\tChecking item[%d] ino: %d - name: %s\n", j, buffer[j].ino, buffer[j].name);
+			}
 
-			if (buffer[j].valid == 1 && buffer[j].ino == entry_inode->ino) {
+			if (buffer[j].valid == 1 && buffer[j].ino == entry_inode->ino && strcmp(buffer[j].name, fname) == 0) {
+				printf("\tFound item to remove at j = [%d]\n", j);
+
 				buffer[j].valid = 0; // mark as invalid or free slot
 				buffer[j].name[0] = '\0';
 
@@ -850,7 +860,7 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode) {
 
 				dir_inode->mtime = now();
 
-				printf("\tUpdated size of dir: %u\n", dir_inode->size);
+				printf("\tUpdated size of dir ino %d: %u\n", dir_inode->ino, dir_inode->size);
 
 				if (entry_inode->type == S_IFDIR) {
 					dir_inode->nlink--;
@@ -889,7 +899,7 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode) {
 	// target does not exist
 	free(buffer);
 
-	return -1;
+	return -ENOENT;
 }
 
 /**
@@ -912,108 +922,102 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	
 	mode_t perm;
 
-	if (strcmp(path, "/") == 0) {
-		// Check if user has permission to access root
+	char *tmp1 = strdup(path);
 
-		// Does not exist
-		if (read_inode(ROOT_INO, inode) < 0) {
-			perror("Cannot read inode");
+	if (tmp1 == NULL) {
+		perror("Cannot allocate memory");
 
-			return -ENOENT;
-		}
+		return -ENOSPC;
+	}	
 
-		if (uid == inode->uid) {
-			perm = get_user_perm(inode->mode);
-		} else if (gid == inode->gid) {
-			perm = get_group_perm(inode->mode);
-		} else {
-			perm = get_other_perm(inode->mode);
-		}
+	char* base = basename(tmp1);
 
-		// Check if perm has "execute" permission
-		if (!PERM_CAN_EXECUTE(perm)) {
-			return -EACCES;
-		}
+	if (strlen(base) > NAME_MAX) return -ENAMETOOLONG;
 
-		return 0;
-	}
-	
+	printf("\tBase: %s\n", base);
+
 	struct inode current = { 0 };
+	struct dirent dir_entry = { 0 };
 
 	if (read_inode(ino, &current) < 0) {
-		perror("Cannot read inode");
-
-		return -ENOENT;
-	}
-	
-	if (current.valid == 0) {
-		return -ENOENT; // root inode is not valid
+		return -EIO;
 	}
 
 	char* path_clone = strdup(path);
 	char* token = strtok(path_clone, "/");
-	
-	struct dirent dir_entry = { 0 };
-	
+	int token_len = 0;
+
 	while (token) {
-		// Check if current is dir
-		if (current.type != S_IFDIR) {
-			return -ENOTDIR;
+		if (strcmp(token, base) != 0) {
+			// Mean we are still in the middle of traversing
+
+			// Check if the current token is a dir
+			// Cannot traverse a file
+			if (current.type != S_IFDIR) {
+				free(path_clone);
+				free(tmp1);
+
+				return -ENOTDIR;
+			}
 		}
 
-		// Check permission
-		printf("\tToken: %s | Perm: %05o\n", token, current.mode);
+		token_len = strlen(token);
 
-		if (uid == current.uid) {
-			perm = get_user_perm(current.mode);
-		} else if (gid == current.gid) {
-			perm = get_group_perm(current.mode);
-		} else {
-			perm = get_group_perm(current.mode);
-		}
+		// Check if we have "x" permission to traverse this dir
+		printf("\tTraversing dir ino: %d | current token is: %s | Perm: %05o\n", current.ino, token, current.mode);
 
-		// Check if perm has "execute" permission
-		if (!PERM_CAN_EXECUTE(perm)) {
+		perm = get_perm_by_inode(uid, gid, &current);
+
+		// Check if perm has "execute" bit
+		if (!PERM_CAN_EXECUTE(perm) && uid != 0) {
 			free(path_clone);
+			free(tmp1);
 
 			return -EACCES;
 		}
 
-		if (strlen(token) > NAME_MAX) {
+		// Now consider token
+		if (token_len > NAME_MAX) {
 			free(path_clone);
+			free(tmp1);
 
 			return -ENAMETOOLONG;
 		}
-		
-		// Find the token in the current directory's inode
-		if (dir_find(current.ino, token, strlen(token), &dir_entry) < 0) {
-			// Token not found
+
+		// Check if the token exists in the current dir
+		if (dir_find(current.ino, token, token_len, &dir_entry) < 0) {
+			// token does not exist
 			perror("[get_node_by_path] Item not found!");
-			
+
 			free(path_clone);
+			free(tmp1);
 
 			return -ENOENT;
 		}
-
+		
 		printf("\tDir entry ino: %d\n", dir_entry.ino);
 
-		// Read inode of the token, then move current to token's inode
-		// a.k.a walking toward to target
+		// Advance current to the next
 		if (read_inode(dir_entry.ino, &current) < 0) {
-			// Unable to read inode struct
 			free(path_clone);
-
-			return -ENOENT;
+			free(tmp1);
+			
+			return -EIO;
 		}
 
 		// Move to the next token
 		token = strtok(NULL, "/");
 	}
 
+	printf("\tIno: %d | Parent Ino: %d | nlink: %d\n", current.ino, current.container_ino, current.nlink);
+
 	// Copy current inode to output inode
 	memcpy(inode, &current, sizeof(struct inode));
 
 	free(path_clone);
+	free(tmp1);
+
+	printf("[get_node_by_path] Done.\n\n");
 		
 	return 0;
 }
@@ -1089,7 +1093,7 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
 
-	if (!PERM_CAN_WRITE(perm)) {
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		return -EACCES;
 	}
 
@@ -1794,7 +1798,7 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 	st_buf->st_mtim = finode.mtime;
 	st_buf->st_ctim = finode.ctime;
 
-	printf("\tPath: %s | Mode: %05o\n", path, finode.mode & 07777);
+	printf("\tPath: %s | Mode: %05o | ino: %d | nlink: %d\n", path, finode.mode & 07777, finode.ino, finode.nlink);
 
 	printf("[myfs_getattr] Done.\n\n");
 
@@ -1834,11 +1838,11 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	mode_t perm = get_perm_by_inode(uid, gid, &dir_inode);
 
 	// Check permission bit
-	if (need_read && !PERM_CAN_READ(perm)) {
+	if (need_read && !PERM_CAN_READ(perm) && uid != 0) {
 		return -EACCES;
 	}
 
-	if (need_write && !PERM_CAN_WRITE(perm)) {
+	if (need_write && !PERM_CAN_WRITE(perm) && uid != 0) {
 		return -EACCES;
 	}
 
@@ -1893,8 +1897,6 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 		return -ENOENT;
 	}
 	
-	int total_dirent = dir_inode.size / sizeof(struct dirent);
-
 	// Figure out how many struct dirent can be put into a block
 	int num_dirent_per_block = BLOCK_SIZE / sizeof(struct dirent);
 	
@@ -1914,8 +1916,6 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	
 	// Read from direct first
 	for(; b < DIRECT_PTRS_COUNT; ++b) {
-		if (total_dirent_read == total_dirent) break;
-		
 		if (dir_inode.directs[b] < 0) continue;
 		
 		if (block_read(dir_inode.directs[b], block_buffer) < 0) {
@@ -1926,9 +1926,7 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 			return -EIO;
 		}
 
-		for (int i = 0; i < num_dirent_per_block && i < total_dirent; ++i) {
-			if (total_dirent_read == total_dirent) break;
-			
+		for (int i = 0; i < num_dirent_per_block; ++i) {
 			entry = block_buffer[i];
 
 			// printf("\t\tDump: ");
@@ -1945,8 +1943,6 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 					return -ENOMEM;
 				}
 			}
-
-			total_dirent_read++;	
 		}
 	}
 
@@ -2021,7 +2017,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 
 	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
 
-	if (!PERM_CAN_WRITE(perm)) {
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		return -EACCES;
 	}
 
@@ -2298,16 +2294,16 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 
 	printf("[myfs_rename] old path: %s | new path : %s | flags = %u\n", old_path, new_path, flag);
 
-	struct inode old = { 0 };
-	struct inode old_dir = { 0 };
+	struct inode old_inode = { 0 };
+	struct inode old_dir_inode = { 0 };
 
 	int node_res;
 
-	if ((node_res = get_node_by_path(old_path, ROOT_INO, &old)) < 0) {
+	if ((node_res = get_node_by_path(old_path, ROOT_INO, &old_inode)) < 0) {
 		return node_res;
 	}
 
-	if (read_inode(old.container_ino, &old_dir) < 0) {
+	if (read_inode(old_inode.container_ino, &old_dir_inode) < 0) {
 		perror("Cannot read inode");
 
 		return -ENOENT;
@@ -2319,38 +2315,68 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 
 	char* tmp1 = strdup(new_path);
 	char* tmp2 = strdup(new_path);
+	char* tmp3 = strdup(old_path);
+	char* tmp4 = strdup(old_path);
 
-	if (tmp1 == NULL || tmp2 == NULL) {
+	if (tmp1 == NULL || tmp2 == NULL || tmp3 == NULL) {
 		perror("Cannot allocate memory");
 
 		if (tmp1) free(tmp1);
 		if (tmp2) free(tmp2);
+		if (tmp3) free(tmp3);
+		if (tmp4) free(tmp4);
 
 		return -ENOSPC;
 	}
 
 	char* base = basename(tmp1);
 	char* dir = dirname(tmp2);
+	char* old_dir = dirname(tmp3);
+	char* old_base = basename(tmp4);
 
-	// if (base == NULL || dir == NULL) {
-	// 	perror("Cannot allocate memory");
-
-	// 	if (base) free(base);
-	// 	if (dir) free(dir);
-
-	// 	return -ENOSPC;
-	// }
-
-	if (strcmp(base, "") == 0) {
-		perror("Cannot rename - target has no specified name");
+	if (strcmp(base, "") == 0 || strcmp(old_base, "") == 0) {
+		perror("Cannot rename - target or origin has no specified name");
 
 		free(tmp1);
 		free(tmp2);
+		free(tmp3);
+		free(tmp4);
 
 		return -EINVAL;
 	}
 
-	printf("\t New path: %s does not exist => dir: %s | base: %s\n", old, dir, base);
+	// Check if dir exists
+	struct inode* dir_inode = NULL;
+	bool needs_dir_free = false;
+
+	if (strcmp(dir, old_dir) == 0) {
+		printf("\tSame directory\n");
+
+		dir_inode = &old_dir_inode;
+	} else {
+		needs_dir_free = true;
+
+		dir_inode = (struct inode*)malloc(sizeof(struct inode));
+
+		if (dir_inode == NULL) {
+			free(tmp1);
+			free(tmp2);
+			free(tmp3);
+			free(tmp4);
+
+			return -ENOSPC;
+		}
+
+		if ((node_res = get_node_by_path(dir, ROOT_INO, dir_inode)) < 0) {
+			free(tmp1);
+			free(tmp2);
+			free(tmp3);
+			free(tmp4);
+			free(dir_inode);
+
+			return node_res;
+		}
+	}
 
 	// Check if new_path already exists
 	struct inode new = { 0 };
@@ -2359,46 +2385,48 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 		if (node_res == -EACCES) {
 			free(tmp1);
 			free(tmp2);
+			free(tmp3);
 
 			return -EACCES;
 		}
+
+		printf("\tNew path: %s does not exist => base: %s | old base: %s\n", new_path, base, old_base);
 
 		// new path does not exist
 		// remove old entry
 		// and move that entry to b's dir
 
-		// Check if dir exists
-		struct inode dir_inode = { 0 };
-
-		if ((node_res = get_node_by_path(dir, ROOT_INO, &dir_inode)) < 0) {
-			free(tmp1);
-			free(tmp2);
-			
-			return node_res;
-		}
-
 		// Remove entry from old path
-		if (dir_remove(&old_dir, &old) < 0) {
+		if (dir_remove(&old_dir_inode, &old_inode, old_base) < 0) {
 			perror("Cannot remove entry");
 
 			free(tmp1);
 			free(tmp2);
+			free(tmp3);
+			free(tmp4);
+			if (needs_dir_free) free(dir_inode);
 
 			return -EIO;
 		}
 
 		// Add new entry to new path
-		if (dir_add(&dir_inode, old.ino, base, strlen(base)) < 0) {
+		if (dir_add(dir_inode, old_inode.ino, base, strlen(base)) < 0) {
 			perror("Cannot add new entry");
 
 			free(tmp1);
 			free(tmp2);
+			free(tmp3);
+			free(tmp4);
+			if (needs_dir_free) free(dir_inode);
 
 			return -EIO;
 		}
 
 		free(tmp1);
 		free(tmp2);
+		free(tmp3);
+		free(tmp4);
+		if (needs_dir_free) free(dir_inode);
 
 		return 0;
 	}
@@ -2408,58 +2436,62 @@ static int myfs_rename(const char* old_path, const char* new_path, unsigned int 
 	// make new's entry point to old's inode
 	
 	// Check if types are compatible
-	if ((old.type == S_IFDIR && new.type != S_IFDIR) || (old.type != S_IFDIR && new.type == S_IFDIR)) {
+	if ((old_inode.type == S_IFDIR && new.type != S_IFDIR) || (old_inode.type != S_IFDIR && new.type == S_IFDIR)) {
 		perror("Cannot rename from a directory to a non-directory entity");
 
 		free(tmp1);
 		free(tmp2);
+		free(tmp3);
+		free(tmp4);
+		if (needs_dir_free) free(dir_inode);
 
 		return -EISDIR;
 	}
 
-	struct inode new_dir = { 0 };
-
-	if (read_inode(new.container_ino, &new_dir) < 0) {
-		perror("Cannot read inode");
-
-		free(tmp1);
-		free(tmp2);
-
-		return -ENOENT;
-	}
-
 	// Remove new's entry
-	if (dir_remove(&new_dir, &new) < 0) {
+	if (dir_remove(dir_inode, &new, base) < 0) {
 		perror("Cannot remove entry");
 
 		free(tmp1);
 		free(tmp2);
-		
+		free(tmp3);
+		free(tmp4);
+		if (needs_dir_free) free(dir_inode);
+
 		return -EIO;
 	}
 
 	// Create new now point to old's inode but in new's dir
-	if (dir_add(&new_dir, old.ino, base, strlen(base)) < 0) {
+	if (dir_add(dir_inode, old_inode.ino, base, strlen(base)) < 0) {
 		perror("Cannot add entry");
 
 		free(tmp1);
 		free(tmp2);
+		free(tmp3);
+		free(tmp4);
+		if (needs_dir_free) free(dir_inode);
 
 		return -EIO;
 	}
 
 	// Remove old's entry
-	if (dir_remove(&old_dir, &old) < 0) {
+	if (dir_remove(&old_dir_inode, &old_inode, old_base) < 0) {
 		perror("Cannot remove entry");
 
 		free(tmp1);
 		free(tmp2);
+		free(tmp3);
+		free(tmp4);
+		if (needs_dir_free) free(dir_inode);
 
 		return -EIO;
 	}
 
 	free(tmp1);
 	free(tmp2);
+	free(tmp3);
+	free(tmp4);
+	if (needs_dir_free) free(dir_inode);
 
 	return 0;
 }
@@ -2492,15 +2524,27 @@ static int myfs_rmdir(const char* path) {
 	// Can only delete empty dir
 	// Check if dir is empty
 	if (dir_inode.size > 2 * sizeof(struct dirent)) {
+		printf("\tDir ino: %d is not empty - Currently has: %d items\n", dir_inode.ino, dir_inode.size / sizeof(struct dirent));
+		
 		return -ENOTEMPTY;
 	}
 
 	printf("\tdir is a valid empty directory\n");
 
+	char* tmp = strdup(path);
+
+	if (tmp == NULL) {
+		return -ENOSPC;
+	}
+
+	char* base = basename(tmp);
+
 	struct inode parent_inode = { 0 };
 
 	if (read_inode(dir_inode.container_ino, &parent_inode) < 0) {
 		perror("Cannot read inode");
+
+		free(tmp);
 
 		return -ENOENT;
 	}
@@ -2514,7 +2558,9 @@ static int myfs_rmdir(const char* path) {
 
 	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
 
-	if (!PERM_CAN_WRITE(perm)) {
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		free(tmp);
+
 		return -EACCES;
 	}
 
@@ -2522,16 +2568,22 @@ static int myfs_rmdir(const char* path) {
 	// owner of the parent dir of the being deleted entry or root can perform rmdir
 	if (parent_inode.mode & S_ISVTX) {
 		if (ctx->uid != parent_inode.uid && ctx->uid != dir_inode.uid && ctx->uid != 0) {
+			free(tmp);
+
 			return -EPERM;
 		}
 	}
 
 	// Remove dir entry from parent
-	if (dir_remove(&parent_inode, &dir_inode) < 0) {
+	if (dir_remove(&parent_inode, &dir_inode, base) < 0) {
 		perror("Cannot remove dir entry from parent");
+
+		free(tmp);
 
 		return -EIO;
 	}
+
+	free(tmp);
 
 	// reset data block if it has any allocated data blocks
 	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
@@ -2633,7 +2685,7 @@ static int myfs_unlink(const char* path) {
 	if (strcmp(path, "/") == 0) {
 		perror("Cannot remove root directory");
 
-		return -EISDIR;
+		return -EBUSY;
 	}
 
 	struct inode f_inode = { 0 };
@@ -2646,27 +2698,59 @@ static int myfs_unlink(const char* path) {
 
 	// Check if this is a file or a softlink
 	if (f_inode.type == S_IFDIR) {
-		return -EISDIR;
+		return -EPERM;
 	}
 
 	printf("\t File is a valid file to be removed\n");
+
+	char* tmp = strdup(path);
+
+	if (tmp == NULL) {
+		return -ENOSPC;
+	}
+
+	char* base = basename(tmp);
 
 	struct inode parent_inode = { 0 };
 
 	if (read_inode(f_inode.container_ino, &parent_inode) < 0) {
 		perror("Cannot read inode");
 
+		free(tmp);
+
 		return -ENOENT;
 	}
 
 	printf("\tParent inode: %d\n", parent_inode.ino);
 
+	// Check if have "w" permission to unlink
+	// In case the parent inode has sticky bit presents, then user must own the file or own the directory or be root user
+	struct fuse_context* ctx = fuse_get_context();
+	
+	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		printf("\tDir does not have write permission - Perm: %05o | Owner is: %d | User is: %d\n", parent_inode.mode, parent_inode.uid, ctx->uid);
+
+		return -EACCES;
+	}
+
+	if (STICKY_MODE(parent_inode.mode)) {
+		if (ctx->uid != f_inode.uid && ctx->uid != parent_inode.uid && ctx->uid != 0) {
+			return -EPERM;
+		}
+	}
+
 	// Remove file entry from parent dir
-	if (dir_remove(&parent_inode, &f_inode) < 0) {
+	if (dir_remove(&parent_inode, &f_inode, base) < 0) { //
 		perror("Cannot remove file entry from parent");
 
-		return -234;
+		free(tmp);
+
+		return -EIO;
 	}
+
+	free(tmp);
 
 	// Check if nlink == 0 && open count == 0
 	// If nlink is 0 and open count is 0, remove the file content
@@ -2679,6 +2763,8 @@ static int myfs_unlink(const char* path) {
 		for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
 			if (f_inode.directs[i] >= 0) {
 				if (reset_data_block(f_inode.directs[i]) < 0) {
+					printf("\treset_data_block\n");
+
 					perror("Cannot reset data block");
 
 					return -EIO;
@@ -2697,6 +2783,8 @@ static int myfs_unlink(const char* path) {
 			}
 
 			if (block_read(f_inode.indirect_ptr, buf) < 0) {
+				printf("\tblock_read\n");
+
 				perror("Cannot read block");
 
 				return -EIO;
@@ -2706,6 +2794,8 @@ static int myfs_unlink(const char* path) {
 				if (buf[i] < 0) continue;
 
 				if (reset_data_block(buf[i]) < 0) {
+					printf("\treset_data_block_2\n");
+
 					perror("Cannot reset data block");
 
 					return -EIO;
@@ -2717,6 +2807,8 @@ static int myfs_unlink(const char* path) {
 
 		// reset inode
 		if (reset_ino(f_inode.ino) < 0) {
+			printf("\treset_inode\n");
+
 			perror("Cannot reset inode");
 
 			return -EIO;
@@ -2775,17 +2867,9 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		gid_t gid = ctx->gid;
 
 		// Check if it has write permission
-		mode_t perm;
+		mode_t perm = get_perm_by_inode(uid, gid, &f_inode);
 
-		if (uid == f_inode.uid) {
-			perm = get_user_perm(f_inode.mode);
-		} else if (gid == f_inode.gid) {
-			perm = get_group_perm(f_inode.mode);
-		} else {
-			perm = get_other_perm(f_inode.mode);
-		}
-
-		if (!PERM_CAN_WRITE(perm)) {
+		if (!PERM_CAN_WRITE(perm) && uid != 0) {
 			return -EACCES;
 		}
 	}
@@ -3258,6 +3342,12 @@ static int myfs_symlink(const char* target, const char* link) {
 
 	assert(ctx != NULL);
 
+	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		return -EACCES;
+	}
+
 	struct inode new_file_inode = make_inode(ino, parent_inode.ino, __S_IFLNK, 0755, 0, ctx->uid, ctx->gid);
 
 	if (write_inode(ino, &new_file_inode) < 0) {
@@ -3403,6 +3493,17 @@ static int myfs_link(const char* target, const char* link) {
 		return -ENOENT;
 	}
 
+	// Check if we have write permission or root user
+	struct fuse_context* ctx = fuse_get_context();
+
+	assert(ctx != NULL);
+
+	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+
+	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		return -EACCES;
+	}
+
 	struct inode target_inode = { 0 };
 
 	if ((node_res = get_node_by_path(target, ROOT_INO, &target_inode)) < 0) {
@@ -3411,6 +3512,8 @@ static int myfs_link(const char* target, const char* link) {
 
 		return node_res;
 	}
+
+	printf("\tTarget ino for hard link is: %d\n", target_inode.ino);
 
 	if (dir_add(&parent_inode, target_inode.ino, base, strlen(base)) < 0) {
 		perror("Cannot add entry to directory");
