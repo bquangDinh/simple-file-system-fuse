@@ -42,6 +42,8 @@ struct superblock {
 	uint32_t d_bitmap_blk; 		// start block of data bitmap
 	uint32_t i_start_blk; 		// start block of inode region					  					  			
 	uint32_t d_start_blk;		// start block of data region
+	uint32_t free_blk_count;	// number of free data blocks
+	uint32_t free_ino_count;	// number of free inode
 };
 
 struct inode {
@@ -68,8 +70,13 @@ struct inode {
 struct dirent {
 	uint16_t ino;				// inode number
 	uint16_t valid;				// bit check if directory entry is valid
-	char name[NAME_MAX];		// maximum bytes for file name
+	char name[NAME_MAX + 1];		// maximum bytes for file name
 	uint16_t len;				// length of file name actually
+};
+
+struct file_handler {
+	uint16_t ino;
+	int flags;	
 };
 
 /**
