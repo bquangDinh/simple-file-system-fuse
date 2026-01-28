@@ -47,7 +47,7 @@ struct superblock {
 };
 
 struct inode {
-	uint16_t ino;				// inode number
+	ino_t ino;				// inode number
 	uint16_t container_ino;		// inode number of parent
 	uint16_t valid;				// bit check if inode is valid
 	uint32_t size;				// size of the file
@@ -68,7 +68,7 @@ struct inode {
 };
 
 struct dirent {
-	uint16_t ino;				// inode number
+	ino_t ino;				// inode number
 	uint16_t valid;				// bit check if directory entry is valid
 	char name[NAME_MAX + 1];		// maximum bytes for file name
 	uint16_t len;				// length of file name actually
