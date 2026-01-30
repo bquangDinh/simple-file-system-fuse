@@ -25,20 +25,84 @@
 
 #define HAVE_UTIMESAT
 
+#define P_WRITE 'w'
+#define P_READ 'r'
+#define P_EXECUTE 'x'
+
+#define P_ONLY_W "w"
+#define P_ONLY_R "r"
+#define P_ONLY_X "x"
+
+// write and read
+#define P_WR "wr"
+
+// write and execute
+#define P_WX "wx"
+
+// read and execute
+#define P_RE "rx"
+
+/**
+ * Helper macros
+ */
 #define ARRAY_FILL(arr, value, len) \
 	for (size_t i = 0; i < len; ++i) \
 		(arr)[i] = (value)
 
+#define FREE_ALL(...) do { \
+	void *ptrs[] = { __VA_ARGS__ }; \
+	for (size_t i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); i++) \
+		free(ptrs[i]); \
+} while (0);
+
+#define IS_STR_EMPTY(str) (strcmp(str, "") == 0)
+#define IS_DIR(inode) ((inode).type == S_IFDIR)
+#define IS_DIR_STICKY(inode) ((inode).mode & S_ISVTX)
+
+#define IS_ROOT(uid) (uid == 0)
+
+/**
+ * Permission Utilities
+ */
 #define PERM_CAN_READ(perm) (perm & 4)
 #define PERM_CAN_WRITE(perm) (perm & 2)
 #define PERM_CAN_EXECUTE(perm) (perm & 1)
-#define STICKY_MODE(mode) mode & S_ISVTX
+#define STICKY_MODE(mode) (mode & S_ISVTX)
 
 char diskfile_path[PATH_MAX];
 
 struct superblock* superblock = NULL;
 int ROOT_INO = 1;
 bool SUPERBLOCK_EXISTED = false;
+
+// --------------------- HELPER FUNCTIONS ------------------------------
+mode_t get_user_perm(mode_t mode) {
+	return (mode >> 6) & 7;
+}
+
+mode_t get_group_perm(mode_t mode) {
+	return (mode >> 3) & 7;
+}
+
+mode_t get_other_perm(mode_t mode) {
+	return mode & 7;
+}
+
+mode_t get_perm_by_inode(uid_t uid, gid_t gid, const struct inode* inode) {
+	assert(inode != NULL);
+
+	mode_t perm;
+
+	if (uid == inode->uid) {
+		perm = get_user_perm(inode->mode);
+	} else if (gid == inode->gid) {
+		perm = get_group_perm(inode->mode);
+	} else {
+		perm = get_other_perm(inode->mode);
+	}
+
+	return perm;
+}
 
 static inline void dump_str(const char*s, size_t len) {
 	for (size_t i = 0; i < len; ++i) printf("%02x", (unsigned char)s[i]);
@@ -54,6 +118,104 @@ static inline struct timespec now(void) {
 
 	return ts;	
 }
+
+static int split_path(const char* path, struct path_split* out) {
+	assert(path != NULL);
+	assert(out != NULL);
+
+	size_t len = strlen(path);
+	char* buf = malloc(len + 1); // account for NULL-terminated character at the end
+
+	if (buf == NULL) return -ENOMEM;
+
+	// Since we cannot modify path (const), we memcpy it to buf
+	memcpy(buf, path, len + 1);
+
+	// Strip trailing slashes such as /a/b/, /a/b/////// -> /a/b
+	while (len > 1 && buf[len - 1] == '/') buf[--len] = '\0';
+
+	// Find the location of the last '/'
+	// strrchr returns a pointer that points to the location of the last slash
+	char* slash = strrchr(buf, '/');
+
+	if (slash == NULL) {
+		// There is no slash, just name
+		// Then we make dir to be ".", then base is "name"
+		out->buf = buf;
+		out->dir = (char*)".";
+		out->base = buf;
+
+		return 0;
+	}
+
+	if (slash == buf) {
+		// "/name" or "/"
+		// slash and buf are both pointers point to the begining of some string
+		// thus, if slash == buf, it means they are both pointing to the beginning of the string
+		// so the only cases are "/name" or "/"
+		// Same as above, dir is "." and base is "name" OR base is empty
+		out->buf = buf;
+		out->dir = (char*)".";
+
+		// slash + 1 makes base point to the next character which is the begining of "name"
+		out->base = (len == 1) ? (char*)"" : (slash + 1);
+
+		return 0;
+	}
+
+	// In this case
+	// we could have "/a/b/c"
+
+	// slash points to the last slash
+	// which mean /a/b/<HERE>c
+	// changing it to NULL-terminated character will split dir and base into /a/b[\0]c
+	*slash = '\0'; 
+	out->buf = buf;
+	out->dir = buf;
+	out->base = slash + 1;
+
+	return 0;
+}
+
+static void free_split_path(struct path_split* p) {
+	if (p && p->buf) free(p->buf);
+}
+
+static bool check_permissions(struct inode* i, const char* req) {
+	assert(i != NULL);
+	assert(req != NULL);
+
+	printf("[check_permissions] ino: %ld | requested permissions: %s\n", i->ino, req);
+
+	struct fuse_context *ctx = fuse_get_context();
+
+	assert(ctx != NULL);
+
+	uid_t uid = ctx->uid;
+	gid_t gid = ctx->gid;
+
+	mode_t perm = get_perm_by_inode(uid, gid, i);
+
+	printf("\tPerm: %05o\n", i->mode & 07777);
+
+	size_t len = strlen(req);
+
+	for (size_t i = 0; i < len; i++) {
+		if (req[i] == P_WRITE) {
+			// Check if inode has write permission
+			if (!PERM_CAN_WRITE(perm)) return false;
+		} else if (req[i] == P_READ) {
+			// Check if inode has read permission
+			if (!PERM_CAN_READ(perm)) return false;
+		} else if (req[i] == P_EXECUTE) {
+			// Check if inode has execute permission
+			if (!PERM_CAN_EXECUTE(perm)) return false;
+		}
+	}
+
+	return true;
+}
+// -----------------------------------------------------------------------
 
 /**
  * Get the first available inode number from inode bitmap
@@ -232,143 +394,11 @@ int get_avail_blkno() {
 	return -1;
 }
 
-int reset_ino(int ino) {
-	printf("[reset_ino] ino: %d\n", ino);
-
-	assert(superblock != NULL);
-
-	assert(ino >= 0 && ino < superblock->max_inum);
-
-	int num_bits_per_block = BLOCK_SIZE * 8;
-
-	int block = superblock->i_bitmap_blk + (ino / num_bits_per_block);
-
-	int bit_idx = ino % num_bits_per_block;
-
-	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
-
-	if (bitmap == NULL) {
-		return -ENOSPC;
-	}
-
-	printf("\tReading and updating bitmap from block %d at bit index %d\n", block, bit_idx);
-
-	if (block_read(block, bitmap) < 0) {
-		perror("Cannot read block");
-
-		return -EIO;
-	}
-
-	set_bitmap(bitmap, bit_idx);
-
-	if (block_write(block, bitmap) < 0) {
-		perror("Cannot write block");
-
-		return -EIO;
-	}
-
-	superblock->free_ino_count++;
-
-	if (block_write(SUPERBLOCK_BLK_NUM, superblock) < 0) {
-		perror("Cannot write block");
-
-		free(bitmap);
-
-		return -EIO;
-	}
-
-	printf("\tUpdated superblock count of free inode. Total free inodes: %d\n", superblock->free_ino_count);
-
-	printf("[reset_ino] Done.\n\n");
-
-	return 0;
-}
-
-int reset_data_block(int data_block) {
-	printf("[reset_data_block] ino: %d\n", data_block);
-
-	assert(superblock != NULL);
-
-	assert(data_block >= superblock->d_start_blk && data_block < superblock->max_dnum);
-
-	int num_bits_per_block = BLOCK_SIZE * 8;
-
-	int block = superblock->d_bitmap_blk + ((data_block - superblock->d_start_blk) / num_bits_per_block);
-
-	int bit_idx = (data_block - superblock->d_start_blk) % num_bits_per_block;
-
-	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
-
-	if (bitmap == NULL) {
-		return -ENOSPC;
-	}
-	
-	printf("\tReading and updating bitmap from block %d at bit index %d\n", block, bit_idx);
-
-	if (block_read(block, bitmap) < 0) {
-		perror("Cannot read block");
-
-		return -EIO;
-	}
-
-	set_bitmap(bitmap, bit_idx);
-
-	if (block_write(block, bitmap) < 0) {
-		perror("Cannot write block");
-
-		return -EIO;
-	}
-
-	superblock->free_blk_count++;
-
-	if (block_write(SUPERBLOCK_BLK_NUM, superblock) < 0) {
-		perror("Cannot write block");
-
-		free(bitmap);
-
-		return -EIO;
-	}
-
-	printf("\tUpdated superblock count of free data blocks. Total free data blocks: %d\n", superblock->free_blk_count);
-
-	printf("[reset_data_block] Done.\n\n");
-
-	return 0;
-}
-
-mode_t get_user_perm(mode_t mode) {
-	return (mode >> 6) & 7;
-}
-
-mode_t get_group_perm(mode_t mode) {
-	return (mode >> 3) & 7;
-}
-
-mode_t get_other_perm(mode_t mode) {
-	return mode & 7;
-}
-
-mode_t get_perm_by_inode(uid_t uid, gid_t gid, const struct inode* inode) {
-	assert(inode != NULL);
-
-	mode_t perm;
-
-	if (uid == inode->uid) {
-		perm = get_user_perm(inode->mode);
-	} else if (gid == inode->gid) {
-		perm = get_group_perm(inode->mode);
-	} else {
-		perm = get_other_perm(inode->mode);
-	}
-
-	return perm;
-}
-
 /**
  * Read inode info given inode number
  */
-int read_inode(uint16_t ino, struct inode* inode) {
-	printf("[read_inode] ino: %d\n", ino);
+int read_inode(ino_t ino, struct inode* inode) {
+	printf("[read_inode] ino: %ld\n", ino);
 
 	assert(inode != NULL);
 	assert(superblock != NULL);
@@ -386,7 +416,7 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	if (inode_table == NULL) {
 		perror("Cannot allocate memory");
 
-		return -ENOSPC;
+		return -ENOMEM;
 	}
 
 	if (block_read(block_index + offset, inode_table) < 0) {
@@ -401,7 +431,7 @@ int read_inode(uint16_t ino, struct inode* inode) {
 	
 	free(inode_table);
 
-	printf("\tRead from inode table of ino: %d\n", inode->ino);
+	printf("\tRead from inode table of ino: %ld\n", inode->ino);
 
 	printf("[read_inode] Done.\n\n");
 
@@ -411,8 +441,8 @@ int read_inode(uint16_t ino, struct inode* inode) {
 /**
  * Write into inode given inode number
  */
-int write_inode(uint16_t ino, struct inode* inode) {
-	printf("[write_inode] ino: %d\n", ino);
+int write_inode(ino_t ino, struct inode* inode) {
+	printf("[write_inode] ino: %ld\n", ino);
 
 	assert(inode != NULL);
 	assert(superblock != NULL);
@@ -467,7 +497,7 @@ int write_inode(uint16_t ino, struct inode* inode) {
 	return 0;
 }
 
-struct inode make_inode(uint16_t ino, uint32_t type, mode_t mode, int nlink, uid_t uid, gid_t gid) {
+struct inode make_inode(ino_t ino, uint32_t type, mode_t mode, int nlink, uid_t uid, gid_t gid) {
 	assert(superblock != NULL);
 	assert(ino < superblock->max_inum);
 	
@@ -481,7 +511,7 @@ struct inode make_inode(uint16_t ino, uint32_t type, mode_t mode, int nlink, uid
 	node.valid = 1;
 	node.size = 0;
 	node.type = type;
-	node.mode = type | mode;
+	node.mode = type | (mode & 07777);
 	node.nlink = nlink;
 
 	node.atime = now();
@@ -497,13 +527,177 @@ struct inode make_inode(uint16_t ino, uint32_t type, mode_t mode, int nlink, uid
 	return node;
 }
 
+int reset_ino(ino_t ino) {
+	printf("[reset_ino] ino: %ld\n", ino);
+
+	assert(superblock != NULL);
+
+	assert(ino >= 0 && ino < superblock->max_inum);
+
+	int num_bits_per_block = BLOCK_SIZE * 8;
+
+	int block = superblock->i_bitmap_blk + (ino / num_bits_per_block);
+
+	int bit_idx = ino % num_bits_per_block;
+
+	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
+
+	if (bitmap == NULL) {
+		return -ENOSPC;
+	}
+
+	printf("\tReading and updating bitmap from block %d at bit index %d\n", block, bit_idx);
+
+	if (block_read(block, bitmap) < 0) {
+		perror("Cannot read block");
+
+		return -EIO;
+	}
+
+	set_bitmap(bitmap, bit_idx);
+
+	if (block_write(block, bitmap) < 0) {
+		perror("Cannot write block");
+
+		return -EIO;
+	}
+
+	superblock->free_ino_count++;
+
+	if (block_write(SUPERBLOCK_BLK_NUM, superblock) < 0) {
+		perror("Cannot write block");
+
+		free(bitmap);
+
+		return -EIO;
+	}
+
+	printf("\tUpdated superblock count of free inode. Total free inodes: %d\n", superblock->free_ino_count);
+
+	printf("[reset_ino] Done.\n\n");
+
+	return 0;
+}
+
+int reset_data_block(uint32_t data_block) {
+	printf("[reset_data_block] ino: %ld\n", data_block);
+
+	assert(superblock != NULL);
+
+	assert(data_block >= superblock->d_start_blk && data_block < superblock->max_dnum);
+
+	int num_bits_per_block = BLOCK_SIZE * 8;
+
+	int block = superblock->d_bitmap_blk + ((data_block - superblock->d_start_blk) / num_bits_per_block);
+
+	int bit_idx = (data_block - superblock->d_start_blk) % num_bits_per_block;
+
+	bitmap_t bitmap = (bitmap_t)malloc(BLOCK_SIZE);
+
+	if (bitmap == NULL) {
+		return -ENOSPC;
+	}
+	
+	printf("\tReading and updating bitmap from block %d at bit index %d\n", block, bit_idx);
+
+	if (block_read(block, bitmap) < 0) {
+		perror("Cannot read block");
+
+		return -EIO;
+	}
+
+	set_bitmap(bitmap, bit_idx);
+
+	if (block_write(block, bitmap) < 0) {
+		perror("Cannot write block");
+
+		return -EIO;
+	}
+
+	superblock->free_blk_count++;
+
+	if (block_write(SUPERBLOCK_BLK_NUM, superblock) < 0) {
+		perror("Cannot write block");
+
+		free(bitmap);
+
+		return -EIO;
+	}
+
+	printf("\tUpdated superblock count of free data blocks. Total free data blocks: %d\n", superblock->free_blk_count);
+
+	printf("[reset_data_block] Done.\n\n");
+
+	return 0;
+}
+
+/**
+ * Free inode and all data blocks it owns
+ */
+int free_inode(ino_t ino) {
+	struct inode finode = { 0 };
+
+	int res = 0;
+
+	if ((res = read_inode(ino, &finode)) < 0) {
+		perror("Cannot read block");
+
+		return res;
+	}
+
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (finode.directs[i] >= 0) {
+			if (reset_data_block(finode.directs[i]) < 0) {
+				perror("Cannot reset data block");
+
+				return -EIO;
+			}
+		}
+	}
+
+	if (finode.indirect_ptr >= 0) {
+		int* buf = (int*)malloc(BLOCK_SIZE);
+		int num_blk = BLOCK_SIZE / sizeof(int);
+
+		if (buf == NULL) {
+			return -ENOMEM;
+		}
+
+		if (block_read(finode.indirect_ptr, buf) < 0) {
+			perror("Cannot read block");
+
+			return -EIO;
+		}
+
+		for (int i = 0; i < num_blk; ++i) {
+			if (buf[i] < 0) continue;
+
+			if (reset_data_block(buf[i]) < 0) {
+				printf("\treset_data_block_2\n");
+
+				perror("Cannot reset data block");
+
+				return -EIO;
+			}
+		}
+
+		if (reset_ino(finode.ino) < 0) {
+			perror("Cannot reset inode");
+
+			return -EIO;
+		}
+	}
+
+	return 0;
+}
+
 /**
  * Find directory given name, return dirent struct
  * If the provided dirent is NULL, then dir_find won't fill the dirent struct
  * but still return the result of whether the item exists or not
  */
-int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* dirent) {
-	printf("[dir_find] ino: %d, fname: %s, name_len: %ld\n", ino, fname, name_len);
+int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* dirent) {
+	printf("[dir_find] ino: %ld, fname: %s, name_len: %ld\n", ino, fname, name_len);
 
 	assert(superblock != NULL);
 	assert(fname != NULL);
@@ -531,7 +725,7 @@ int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* di
 	if (buffer == NULL) {
 		perror("Cannot allocate memory");
 
-		return -ENOSPC;
+		return -ENOMEM;
 	}	
 
 	// int total_dirents_read = 0;
@@ -556,7 +750,7 @@ int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* di
 				printf("\t\tChecking item[%d]: %s at block %d\n", j, buffer[j].name, dir_inode.directs[i]);
 				
 				if (strncmp(buffer[j].name, fname, name_len) == 0) {
-					printf("\t\tFound item | ino: %d\n", buffer[j].ino);
+					printf("\t\tFound item | ino: %ld\n", buffer[j].ino);
 	
 					if (dirent != NULL) {
 						memcpy(dirent, &buffer[j], sizeof(struct dirent));
@@ -576,16 +770,18 @@ int dir_find(uint16_t ino, const char* fname, size_t name_len, struct dirent* di
 
 	free(buffer);
 
+	printf("\tEntry of name: %s does not exist\n", fname);
+
 	printf("[dir_find] Done.\n\n");
 
-	return -1;
+	return -ENOENT;
 }
 
 /**
  * Add directory given name
  */
-int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t name_len) {
-	printf("[dir_add] f_ino: %d | fname: %s | name_len: %ld\n", f_ino, fname, name_len);
+int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name_len) {
+	printf("[dir_add] f_ino: %ld | fname: %s | name_len: %ld\n", f_ino, fname, name_len);
 
 	assert(superblock != NULL);
 	assert(dir_inode != NULL);
@@ -660,19 +856,19 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 				}
 				
 				// Update size
-				dir_inode->size += sizeof(struct dirent);
+				// dir_inode->size += sizeof(struct dirent);
 
 				// Update mtime
 				dir_inode->mtime = now();
 				
-				printf("\tUpdated parent dir ino %d size to: %u\n", dir_inode->ino, dir_inode->size);
+				// printf("\tUpdated parent dir ino %d size to: %u\n", dir_inode->ino, dir_inode->size);
 
 				// num nlink of dir = 2 + num sub directories
-				if (f_inode.type == S_IFDIR && f_inode.ino != dir_inode->ino) {
-					dir_inode->nlink++;
-				}
+				// if (f_inode.type == S_IFDIR) {
+				// 	dir_inode->nlink++;
+				// }
 
-				printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
+				// printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
 
 				if (write_inode(dir_inode->ino, dir_inode) < 0) {
 					perror("Cannot write inode");
@@ -682,23 +878,23 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 					return -EIO;
 				}
 				
-				// Update link count of target ino
-				// To prevent dir_add adding itself
-				if (f_ino != dir_inode->ino) {
-					f_inode.nlink++;
+				// // Update link count of target ino
+				// // To prevent dir_add adding itself
+				// if (f_ino != dir_inode->ino) {
+				// 	f_inode.nlink++;
 
-					printf("\tUpdated nlink of ino: %d to %d\n", f_inode.ino, f_inode.nlink);
+				// 	printf("\tUpdated nlink of ino: %ld to %d\n", f_inode.ino, f_inode.nlink);
 
-					if (write_inode(f_ino, &f_inode) == -1) {
-						perror("Cannot write inode");
+				// 	if (write_inode(f_ino, &f_inode) == -1) {
+				// 		perror("Cannot write inode");
 
-						free(buffer);
+				// 		free(buffer);
 
-						return -EIO;
-					}
+				// 		return -EIO;
+				// 	}
 
-					printf("\tUpdated entry ino: %d nlink to %d\n", f_inode.ino, f_inode.nlink);
-				}
+				// 	printf("\tUpdated entry ino: %ld nlink to %d\n", f_inode.ino, f_inode.nlink);
+				// }
 
 				free(buffer);
 
@@ -706,7 +902,7 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 
 				return 0;
 			} else {
-				printf("\tItem at spot %d is %s ino: %d\n", i, buffer[i].name, buffer[i].ino);
+				printf("\tItem at spot %d is %s ino: %ld\n", i, buffer[i].name, buffer[i].ino);
 			}
 		}
 	}
@@ -745,19 +941,19 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 	}
 
 	// Update size
-	dir_inode->size += sizeof(struct dirent);
+	dir_inode->size += BLOCK_SIZE;
 
 	// Update mtime
 	dir_inode->mtime = now();
 
 	printf("\tUpdated dir size to: %u\n", dir_inode->size);
 
-	// num nlink of dir = 2 + num sub directories
-	if (f_inode.type == S_IFDIR) {
-		dir_inode->nlink++;
-	}
+	// // num nlink of dir = 2 + num sub directories
+	// if (f_inode.type == S_IFDIR) {
+	// 	dir_inode->nlink++;
+	// }
 
-	printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
+	// printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
 
 	if (write_inode(dir_inode->ino, dir_inode) < 0) {
 		perror("Cannot write inode");
@@ -769,22 +965,22 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 
 	printf("\tWrote parent inode update\n");
 
-	// Update link count of target ino
-	if (f_ino != dir_inode->ino) {
-		printf("\tf_ino = %d | dir ino = %d\n", f_ino, dir_inode->ino);
+	// // Update link count of target ino
+	// if (f_ino != dir_inode->ino) {
+	// 	printf("\tf_ino = %d | dir ino = %d\n", f_ino, dir_inode->ino);
 
-		f_inode.nlink++;
+	// 	f_inode.nlink++;
 
-		if (write_inode(f_ino, &f_inode) == -1) {
-			perror("Cannot write inode");
+	// 	if (write_inode(f_ino, &f_inode) == -1) {
+	// 		perror("Cannot write inode");
 
-			free(buffer);
+	// 		free(buffer);
 
-			return -EIO;
-		}
+	// 		return -EIO;
+	// 	}
 
-		printf("\tUpdated entry ino: %d nlink to %d\n", f_inode.ino, f_inode.nlink);
-	}
+	// 	printf("\tUpdated entry ino: %ld nlink to %d\n", f_inode.ino, f_inode.nlink);
+	// }
 
 	free(buffer);
 
@@ -796,34 +992,30 @@ int dir_add(struct inode* dir_inode, uint16_t f_ino, const char* fname, size_t n
 /**
  * Remove an entry from a directory
  */
-int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* fname) {
+int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const char* fname) {
 	assert(superblock != NULL);
 	assert(dir_inode != NULL);
 	assert(fname != NULL);
 	assert(entry_inode != NULL);
 	assert(dir_inode->ino != entry_inode->ino);
 
-	printf("[dir_remove] parent ino: %d about to remove (-> ino: %d): %s\n", dir_inode->ino, entry_inode->ino, fname);
+	printf("[dir_remove] parent ino: %ld about to remove (-> ino: %ld): %s\n", dir_inode->ino, entry_inode->ino, fname);
 
-	int num_entry = dir_inode->size / sizeof(struct dirent);
+	// int num_entry = dir_inode->size / sizeof(struct dirent);
 
 	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
 	
-	printf("\tNum entries: %d | Num entries per block: %d\n", num_entry, num_entries_per_block);
-
-	// int entries_read = 0;
+	printf("\tNum entries per block: %d\n", num_entries_per_block);
 
 	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 
 	if (buffer == NULL) {
 		perror("Cannot allocate memory");
 
-		return -ENOSPC;
+		return -ENOMEM;
 	}
 
 	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
-		// if (entries_read == num_entry) break;
-
 		if (dir_inode->directs[i] < 0) continue;
 
 		if (block_read(dir_inode->directs[i], buffer) < 0) {
@@ -835,12 +1027,11 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* f
 		}
 
 		for (int j = 0; j < num_entries_per_block; ++j) {
-			// if (entries_read == num_entry) break;
 			if (buffer[j].valid == 1) {
-				printf("\tChecking item[%d] ino: %d - name: %s\n", j, buffer[j].ino, buffer[j].name);
+				printf("\tChecking item[%d] ino: %ld - name: %s\n", j, buffer[j].ino, buffer[j].name);
 			}
 
-			if (buffer[j].valid == 1 && buffer[j].ino == entry_inode->ino && strcmp(buffer[j].name, fname) == 0) {
+			if (buffer[j].valid == 1 && strcmp(buffer[j].name, fname) == 0) {
 				printf("\tFound item to remove at j = [%d]\n", j);
 
 				buffer[j].valid = 0; // mark as invalid or free slot
@@ -854,17 +1045,14 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* f
 					return -EIO;
 				}
 
-				dir_inode->size -= sizeof(struct dirent);
-
 				dir_inode->mtime = now();
 
-				printf("\tUpdated size of dir ino %d: %u\n", dir_inode->ino, dir_inode->size);
-
-				if (entry_inode->type == S_IFDIR) {
-					dir_inode->nlink--;
-				}
-
-				printf("\tUpdated parent ino %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
+				// if (entry_inode->type == S_IFDIR) {
+				// 	dir_inode->nlink--;
+				// } else {
+				// 	// Update nlink of target inode
+				// 	entry_inode->nlink--;
+				// }
 
 				if (write_inode(dir_inode->ino, dir_inode) < 0) {
 					perror("Cannot write inode");
@@ -874,25 +1062,24 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* f
 					return -EIO;
 				}
 
-				// Update nlink of target inode
-				entry_inode->nlink--;
+				// if (write_inode(entry_inode->ino, entry_inode) < 0) {
+				// 	perror("Cannot write inode");
 
-				if (write_inode(entry_inode->ino, entry_inode) < 0) {
-					perror("Cannot write inode");
+				// 	return -EIO;
+				// }
 
-					return -EIO;
-				}
-
-				printf("\tUpdated nlink of target ino: %d to be = %d\n", entry_inode->ino, entry_inode->nlink);
+				// printf("\tUpdated nlink of target ino: %ld to be = %d\n", entry_inode->ino, entry_inode->nlink);
 
 				printf("[dir_remove] Done.\n\n");
+
+				free(buffer);
 
 				return 0;
 			}
 		}
 	}
 
-	printf("\tf_ino: %d does not exist in ino: %d\n", entry_inode->ino, dir_inode->ino);
+	printf("\tf_ino: %ld does not exist in ino: %ld\n", entry_inode->ino, dir_inode->ino);
 
 	// target does not exist
 	free(buffer);
@@ -900,11 +1087,143 @@ int dir_remove(struct inode* dir_inode, struct inode* entry_inode, const char* f
 	return -ENOENT;
 }
 
+int dir_entry_count(struct inode* dir_inode) {
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
+
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -ENOMEM;
+	}
+
+	int count = 0;
+
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		if (dir_inode->directs[i] < 0) continue;
+
+		if (block_read(dir_inode->directs[i], buffer) < 0) {
+			perror("Cannot read block");
+			
+			free(buffer);
+
+			return -EIO;
+		}
+
+		for (int j = 0; j < num_entries_per_block; ++j) {
+			if (buffer[j].valid == 1) count++;
+		}
+	}
+
+	free(buffer);
+
+	return count;
+}
+
+/**
+ * Update ".." to point to a different ino
+ */
+int dir_update_dotdot(struct inode* dir_inode, struct inode* new_parent) {
+	printf("[dir_update_dotdot] dir ino is: %ld | change to new parent ino: %ld\n", dir_inode->ino, new_parent->ino);
+
+	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
+
+	if (buffer == NULL) {
+		perror("Cannot allocate memory");
+
+		return -ENOMEM;
+	}
+
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
+
+	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
+		// if (total_dirents_read == total_dirents) break;
+
+		if (dir_inode->directs[i] < 0) continue;
+
+		if (block_read(dir_inode->directs[i], buffer) < 0) {
+			perror("Cannot read block");
+			
+			free(buffer);
+
+			return -EIO;
+		}
+
+		for (int j = 0; j < num_entries_per_block; ++j) {
+			if (buffer[j].valid == 1) {
+				printf("\t\tChecking item[%d]: %s at block %d\n", j, buffer[j].name, dir_inode->directs[i]);
+				
+				if (strncmp(buffer[j].name, "..", 2) == 0) {
+					printf("\t\tFound item | ino: %ld\n", buffer[j].ino);
+					
+					if (buffer[j].ino == new_parent->ino) {
+						// Nothing changes
+						free(buffer);
+
+						return 0;
+					}
+
+					// Before parent nlink before update ino
+					struct inode old_parent = { 0 };
+
+					if (read_inode(buffer[j].ino, &old_parent) < 0) {
+						free(buffer);
+
+						return -EIO;
+					}
+
+					old_parent.nlink--;
+
+					if (write_inode(old_parent.ino, &old_parent) < 0) {
+						free(buffer);
+
+						return -EIO;
+					}
+
+					new_parent->nlink++;
+
+					if (write_inode(new_parent->ino, new_parent) < 0) {
+						free(buffer);
+
+						return -EIO;
+					}
+
+					buffer[j].ino = new_parent->ino;
+
+					// Update buffer
+					if (block_write(dir_inode->directs[i], buffer) < 0) {
+						perror("Cannot write block");
+
+						free(buffer);
+
+						return -EIO;
+					}
+
+					free(buffer);
+	
+					printf("[dir_update_dotdot] Done.\n\n");
+	
+					return 0;
+				}
+			}
+		}
+	}
+
+	free(buffer);
+	
+	printf("\tCannot find '..'. Something went wrong!\n");
+
+	printf("[dir_update_dotdot] Done.\n\n");
+
+	return -ENOENT;
+}
+
 /**
  * Get inode number from the give path, save info into returned inode
  */
-int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
-	printf("[get_node_by_path] path: %s | ino: %d\n", path, ino);
+int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
+	printf("[get_node_by_path] path: %s | ino: %ld\n", path, ino);
 
 	assert(path != NULL);
 	assert(ROOT_INO >= 0);
@@ -962,7 +1281,7 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 		token_len = strlen(token);
 
 		// Check if we have "x" permission to traverse this dir
-		printf("\tTraversing dir ino: %d | current token is: %s | Perm: %05o\n", current.ino, token, current.mode);
+		printf("\tTraversing dir ino: %ld | current token is: %s | Perm: %05o\n", current.ino, token, current.mode);
 
 		perm = get_perm_by_inode(uid, gid, &current);
 
@@ -993,7 +1312,7 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 			return -ENOENT;
 		}
 		
-		printf("\tDir entry ino: %d\n", dir_entry.ino);
+		printf("\tDir entry ino: %ld\n", dir_entry.ino);
 
 		// Advance current to the next
 		if (read_inode(dir_entry.ino, &current) < 0) {
@@ -1007,7 +1326,7 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 		token = strtok(NULL, "/");
 	}
 
-	printf("\tIno: %d | nlink: %d\n", current.ino, current.nlink);
+	printf("\tino: %ld | nlink: %d\n", current.ino, current.nlink);
 
 	// Copy current inode to output inode
 	memcpy(inode, &current, sizeof(struct inode));
@@ -1020,6 +1339,32 @@ int get_node_by_path(const char* path, uint16_t ino, struct inode* inode) {
 	return 0;
 }
 
+/**
+ * Check if i is the descendant of origin
+ */
+bool is_descendant(const struct inode* i, const struct inode* origin) {
+	// if origin is root folder
+	// then it's always true
+	if (origin->ino == ROOT_INO) return true;
+
+	// walk '..' entry of i until either reached root
+	struct dirent parent = { 0 };
+	ino_t current_ino = i->ino;
+
+	do {
+		assert(dir_find(current_ino, "..", 2, &parent) == 0);
+
+		if (parent.ino == origin->ino) return true;
+
+		current_ino = parent.ino;
+	} while (parent.ino != ROOT_INO);
+
+	return false;
+}
+
+/**
+ * Create a file inode
+ */
 int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	assert(path != NULL);
 	assert(out_inode != NULL);
@@ -1027,33 +1372,14 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 	printf("[make_file] path: %s | mode: %o\n", path, mode);
 
-	char* tmp1, *tmp2;
+	struct path_split p = { 0 };
 
-	tmp1 = strdup(path);
-	tmp2 = strdup(path);
+	if (split_path(path, &p) < 0) return -ENOMEM;
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		perror("Cannot allocate memory");
-
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-
-		return -ENOSPC;
-	}	
-
-	char* base = basename(tmp1);
-	char* dir = dirname(tmp2);
+	char* base = p.base;
+	char* dir = p.dir;
 
 	if (strlen(base) > NAME_MAX) return -ENAMETOOLONG;
-
-	// if (base == NULL || dir == NULL) {
-	// 	perror("Cannot allocate memory");
-
-	// 	if (base) free(base);
-	// 	if (dir) free(dir);
-
-	// 	return -ENOSPC;
-	// }
 
 	printf("\tDir: %s | Base: %s\n", dir, base);
 
@@ -1063,23 +1389,20 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	int node_res;
 
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 		
 		return node_res;
 	}
 
 	if (parent_inode.valid == 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -ENOENT;
 	}
 
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EEXIST;
 	}
@@ -1099,22 +1422,21 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	int ino = get_avail_ino();
 
 	if (ino < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -ENOSPC;
 	}
 
 	if (S_ISFIFO(mode)) {
-		*(out_inode) = make_inode(ino, __S_IFIFO, mode, 0, ctx->uid, ctx->gid);
+		*(out_inode) = make_inode(ino, __S_IFIFO, mode, 1, ctx->uid, ctx->gid);
 	} else if (S_ISREG(mode)) {
-		*(out_inode) = make_inode(ino, __S_IFREG, mode, 0, ctx->uid, ctx->gid);
+		*(out_inode) = make_inode(ino, __S_IFREG, mode, 1, ctx->uid, ctx->gid);
 	} else if (S_ISCHR(mode)) {
-		*(out_inode) = make_inode(ino, __S_IFCHR, mode, 0, ctx->uid, ctx->gid);
+		*(out_inode) = make_inode(ino, __S_IFCHR, mode, 1, ctx->uid, ctx->gid);
 	} else if (S_ISBLK(mode)) {
-		*(out_inode) = make_inode(ino, __S_IFBLK, mode, 0, ctx->uid, ctx->gid);
+		*(out_inode) = make_inode(ino, __S_IFBLK, mode, 1, ctx->uid, ctx->gid);
 	} else if (S_ISSOCK(mode)) {
-		*(out_inode) = make_inode(ino, __S_IFSOCK, mode, 0, ctx->uid, ctx->gid);
+		*(out_inode) = make_inode(ino, __S_IFSOCK, mode, 1, ctx->uid, ctx->gid);
 	} else {
 		return -EOPNOTSUPP;
 	}
@@ -1125,35 +1447,35 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	if (write_inode(ino, out_inode) < 0) {
 		perror("Cannot write inode");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EIO;
 	}
 
-	printf("\tWrote file inode ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+	printf("\tWrote file inode ino: %ld to parent ino: %ld\n", ino, parent_inode.ino);
 
 	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
 		perror("Cannot add dirent entry");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EIO;
 	}
 
-	printf("\tAdded file entry ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+	printf("\tAdded file entry ino: %ld to parent ino: %ld\n", ino, parent_inode.ino);
 
-	free(tmp1);
-	free(tmp2);
+	free_split_path(&p);
 	
 	printf("[make_file] Done.\n\n");
 
 	return 0;
 }
 
+/**
+ * Write content into a file
+ */
 int file_write(struct inode* finode, const char* buffer, size_t size, off_t offset) {
-	printf("[file_write] Ino: %d | size: %zu | offset: %u\n", finode->ino, size, offset);
+	printf("[file_write] ino: %ld | size: %zu | offset: %u\n", finode->ino, size, offset);
 
 	if (finode->type == S_IFDIR) {
 		return -EISDIR;
@@ -1336,6 +1658,9 @@ int file_write(struct inode* finode, const char* buffer, size_t size, off_t offs
 	return bytes_written;
 }
 
+/**
+ * Read content from a file
+ */
 int file_read(struct inode* finode, const char* buffer, size_t size, off_t offset) {
 	if (finode->type == S_IFDIR) {
 		return -EISDIR;
@@ -1655,7 +1980,7 @@ int init_inode_region() {
 
 	assert(ctx != NULL);
 
-	struct inode root_inode = make_inode(ROOT_INO, S_IFDIR, 0755, 0, ctx->uid, ctx->gid);
+	struct inode root_inode = make_inode(ROOT_INO, S_IFDIR, 0755, 1, ctx->uid, ctx->gid);
 
 	if (write_inode(ROOT_INO, &root_inode) < 0) {
 		perror("Cannot write inode");
@@ -1801,7 +2126,7 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 	st_buf->st_mtim = finode.mtime;
 	st_buf->st_ctim = finode.ctime;
 
-	printf("\tPath: %s | Mode: %05o | ino: %lu (assigned: %lu) | nlink: %d\n", path, finode.mode & 07777, (unsigned long)finode.ino, (unsigned long)st_buf->st_ino, finode.nlink);
+	printf("\tPath: %s | Mode: %05o | ino: %lu (assigned: %lu) | nlink: %d | dir: %d\n", path, finode.mode & 07777, (unsigned long)finode.ino, (unsigned long)st_buf->st_ino, finode.nlink, IS_DIR(finode));
 
 	printf("[myfs_getattr] Done.\n\n");
 
@@ -1857,7 +2182,7 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 		return -EIO;
 	}
 
-	printf("\tIno: %d -- open counts = %u\n", dir_inode.ino, dir_inode.open_count);
+	printf("\tino: %ld -- open counts = %u\n", dir_inode.ino, dir_inode.open_count);
 
 	// Save inode number of this dir into *fh struct of fuse_file_info
 	struct file_handler* fh = malloc(sizeof(*fh));
@@ -2044,7 +2369,7 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 		return -ENOSPC;
 	}
 
-	struct inode new_dir_inode = make_inode(ino, S_IFDIR, mode, 0, ctx->uid, ctx->gid);
+	struct inode new_dir_inode = make_inode(ino, S_IFDIR, mode, 2, ctx->uid, ctx->gid);
 
 	if (write_inode(ino, &new_dir_inode) < 0) {
 		perror("Cannot write inode");
@@ -2080,6 +2405,13 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	}
 
 	printf("\tWrote dir entry to parent dir inode\n");
+
+	// Update nlink for parent inode
+	parent_inode.nlink++;
+
+	if (write_inode(parent_inode.ino, &parent_inode) < 0) {
+		return -EIO;
+	}
 	
 	free(tmp1);
 	free(tmp2);
@@ -2166,7 +2498,7 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 		return -EIO;
 	}
 
-	printf("\tIno: %d -- open counts = %u\n", finode.ino, finode.open_count);
+	printf("\tino: %ld -- open counts = %u\n", finode.ino, finode.open_count);
 
 	struct file_handler* fh = malloc(sizeof(*fh));
 
@@ -2201,7 +2533,7 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 
 	assert(fh != NULL);
 
-	printf("\tFH ino: %d\n", fh->ino);
+	printf("\tFH ino: %ld\n", fh->ino);
 
 	if (read_inode(fh->ino, &finode) < 0) {
 		perror("Cannot read inode");
@@ -2257,7 +2589,7 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 
 	assert(fh != NULL);
 
-	printf("\tFH ino: %d\n", fh->ino);
+	printf("\tFH ino: %ld\n", fh->ino);
 
 	if (read_inode(fh->ino, &finode) < 0) {
 		perror("Cannot read inode");
@@ -2300,262 +2632,297 @@ static int myfs_fsync(const char* path, int datasync, struct fuse_file_info* fi)
 	return dev_fsync();
 }
 
-static int myfs_rename(const char* old_path, const char* new_path, unsigned int flag) {
-	assert(old_path != NULL);
-	assert(new_path != NULL);
+static int myfs_rename(const char* source_path, const char* target_path, unsigned int flag) {
+	assert(source_path != NULL);
+	assert(target_path != NULL);
 	assert(ROOT_INO != -1);
 
-	printf("[myfs_rename] old path: %s | new path : %s | flags = %u\n", old_path, new_path, flag);
+	printf("[myfs_rename] source path: %s | target path : %s | flags = %u\n", source_path, target_path, flag);
 
-	char* tmp1 = strdup(new_path);
-	char* tmp2 = strdup(new_path);
-	char* tmp3 = strdup(old_path);
-	char* tmp4 = strdup(old_path);
-
-	if (tmp1 == NULL || tmp2 == NULL || tmp3 == NULL) {
-		perror("Cannot allocate memory");
-
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-		if (tmp3) free(tmp3);
-		if (tmp4) free(tmp4);
-
-		return -ENOSPC;
+	struct path_split source_p = { 0 };
+	struct path_split target_p = { 0 };
+	
+	if (split_path(source_path, &source_p) < 0) return -ENOMEM;
+	if (split_path(target_path, &target_p) < 0) {
+		free_split_path(&source_p);
+		return -ENOMEM;
 	}
 
-	char* base = basename(tmp1);
-	char* dir = dirname(tmp2);
-	char* old_dir = dirname(tmp3);
-	char* old_base = basename(tmp4);
+	char* source_dir = source_p.dir;
+	char* source_base = source_p.base;
 
-	if (strcmp(base, "") == 0 || strcmp(old_base, "") == 0) {
-		perror("Cannot rename - target or origin has no specified name");
+	char* target_dir = target_p.dir;
+	char* target_base = target_p.base;
 
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
+	if (IS_STR_EMPTY(source_base) || IS_STR_EMPTY(target_base)) {
+		perror("Cannot rename - source or target has no specified name");
+
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
 		return -EINVAL;
 	}
 
-	struct inode old_inode = { 0 };
-	struct inode old_dir_inode = { 0 };
+	// Look up parents of both source and target
+	struct inode source_parent = { 0 };
 
-	int node_res;
+	if (get_node_by_path(source_dir, ROOT_INO, &source_parent) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-	if ((node_res = get_node_by_path(old_path, ROOT_INO, &old_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-
-		return node_res;
+		return -ENOENT;
 	}
 
-	if ((node_res = get_node_by_path(old_dir, ROOT_INO, &old_dir_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
+	// Check if parent is a valid directory
+	if (!IS_DIR(source_parent)) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-		return node_res;
+		return -ENOTDIR;
 	}
 
-	if (flag != 0) {
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
+	struct inode target_parent = { 0 };
 
-		return -EOPNOTSUPP;
+	if (get_node_by_path(target_dir, ROOT_INO, &target_parent) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
+
+		return -ENOENT;
 	}
 
-	// Check if dir exists
-	struct inode* dir_inode = NULL;
-	bool needs_dir_free = false;
+	// Check if the target parent is a valid directory
+	if (!IS_DIR(target_parent)) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-	if (strcmp(dir, old_dir) == 0) {
-		printf("\tSame directory\n");
-
-		dir_inode = &old_dir_inode;
-	} else {
-		needs_dir_free = true;
-
-		dir_inode = (struct inode*)malloc(sizeof(struct inode));
-
-		if (dir_inode == NULL) {
-			free(tmp1);
-			free(tmp2);
-			free(tmp3);
-			free(tmp4);
-
-			return -ENOSPC;
-		}
-
-		if ((node_res = get_node_by_path(dir, ROOT_INO, dir_inode)) < 0) {
-			free(tmp1);
-			free(tmp2);
-			free(tmp3);
-			free(tmp4);
-			free(dir_inode);
-
-			return node_res;
-		}
+		return -ENOTDIR;
 	}
 
-	// Check if we have permission "w" or root user to write into new dir and "w" on old dir to remove entry
 	struct fuse_context* ctx = fuse_get_context();
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, dir_inode);
+	uid_t uid = ctx->uid;
+	gid_t gid = ctx->gid;
 
-	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+	// Check permissions
+	if (!check_permissions(&source_parent, P_WX) && !IS_ROOT(uid)) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
+
 		return -EACCES;
 	}
 
-	perm = get_perm_by_inode(ctx->uid, ctx->gid, &old_dir_inode);
+	if (!check_permissions(&target_parent, P_WX) && !IS_ROOT(uid)) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		return -EACCES;
 	}
 
-	// For sticky behavior
-	if (STICKY_MODE(old_dir_inode.mode)) {
-		if (ctx->uid != old_inode.uid && ctx->uid != old_dir_inode.uid && ctx->uid != 0) {
+	// Find source entry, make sure it exists
+	struct dirent source_entry = { 0 };
+
+	int res = 0;
+
+	if ((res = dir_find(source_parent.ino, source_base, strlen(source_base), &source_entry)) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
+	
+		return res;
+	}
+
+	// Obtain source inode
+	struct inode source_inode = { 0 };
+
+	if ((res = read_inode(source_entry.ino, &source_inode)) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
+
+		return res;
+	}
+
+	// Check for sticky behavior
+	if (IS_DIR_STICKY(source_parent)) {
+		if (
+			!IS_ROOT(uid) && 			// user is not the root user
+			uid != source_parent.uid && // user does not own the source directory
+			uid != source_inode.uid 	// user does not own the source file
+		) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+
 			return -EPERM;
 		}
 	}
 
-	// Check if new_path already exists
-	struct inode new = { 0 };
+	// Lookup destination
+	struct dirent target_entry = { 0 };
+	struct inode target_inode = { 0 };
 
-	if ((node_res = get_node_by_path(new_path, ROOT_INO, &new)) < 0) {
-		if (node_res == -EACCES) {
-			free(tmp1);
-			free(tmp2);
-			free(tmp3);
+	// Does the target exist in the target directory already?
+	bool target_exist = false;
 
-			return -EACCES;
+	if ((res = dir_find(target_parent.ino, target_base, strlen(target_base), &target_entry)) < 0) {
+		if (res != -ENOENT) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+
+			return res;
 		}
 
-		// Check sticky behavior on the new dir only
-		if (STICKY_MODE(dir_inode->mode)) {
-			if (ctx->uid != dir_inode->uid && ctx->uid != 0) {
+		target_exist = false;
+	} else {
+		target_exist = true;
+	}
+
+	if (target_exist) {
+		if ((res = read_inode(target_entry.ino, &target_inode)) < 0) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+	
+			return res;
+		}
+
+		// Check for sticky behavior on the target directory
+		// since we're about to removing and replace entry in this directory
+		if (IS_DIR_STICKY(target_parent)) {
+			if (
+				!IS_ROOT(uid) &&			// user is not root
+				uid != target_parent.uid &&	// user does not own the target directory
+				uid != target_inode.uid		// user does not own the target entry
+			) {
+				free_split_path(&source_p);
+				free_split_path(&target_p);
+	
 				return -EPERM;
 			}
 		}
 
-		printf("\tNew path: %s does not exist => base: %s | old base: %s\n", new_path, base, old_base);
+		// Check for compatibility
+		// you can't rename a file into a directory or vice versa
+		if (IS_DIR(source_inode) && !IS_DIR(target_inode)) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
 
-		// new path does not exist
-		// remove old entry
-		// and move that entry to b's dir
+			return -ENOTDIR;
+		}
 
-		// Remove entry from old path
-		if (dir_remove(&old_dir_inode, &old_inode, old_base) < 0) {
-			perror("Cannot remove entry");
+		if (!IS_DIR(source_inode) && IS_DIR(target_inode)) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
 
-			free(tmp1);
-			free(tmp2);
-			free(tmp3);
-			free(tmp4);
-			if (needs_dir_free) free(dir_inode);
+			return -EISDIR;
+		}
+
+		// Since we want to replace entry and if that entry is a dir, the target directory must be empty
+		if (IS_DIR(target_inode) && dir_entry_count(&target_inode) > 2) {
+			printf("\tRRENAME COUNT: %d\n", dir_entry_count(&target_inode));
+
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+
+			return -ENOTEMPTY;
+		}
+	}
+
+	// For source entry
+	// If source entry is a folder, we can't move the source entry (a dir) into its own subtree
+	if (IS_DIR(source_inode)) {
+		// Ex: c has structure like this
+		// c:
+		// 	--> b
+		//	--> d/e
+		// we can't do "rename c -> c/d/e/<new_c>"
+		if (source_parent.ino != target_parent.ino) {
+			if (is_descendant(&target_parent, &source_inode)) {
+				free_split_path(&source_p);
+				free_split_path(&target_p);
+
+				return -EINVAL;
+			}
+		}
+	}
+
+	// If rename cross-directory, user must own the source directory (in case of directory)
+	if (IS_DIR(source_inode) && source_parent.ino != target_parent.ino) {
+		if (
+			!IS_ROOT(uid) &&
+			uid != source_inode.uid
+		) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+
+			return -EACCES;
+		}
+	}
+
+	// All good to perform rename
+	if (target_exist) {
+		assert(target_inode.ino != 0);
+
+		// Remove target entry from target directory
+		if ((res = dir_remove(&target_parent, &target_inode, target_base)) < 0) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
+
+			return res;
+		}
+
+		// Update nlink
+		target_inode.nlink--;
+
+		if (write_inode(target_inode.ino, &target_inode) < 0) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
 
 			return -EIO;
 		}
 
-		// Add new entry to new path
-		if (dir_add(dir_inode, old_inode.ino, base, strlen(base)) < 0) {
-			perror("Cannot add new entry");
+		if (target_inode.nlink <= 0 && target_inode.open_count <= 0) {
+			// remove inode
+			if ((res = free_inode(target_inode.ino)) < 0) {
+				free_split_path(&source_p);
+				free_split_path(&target_p);
 
-			free(tmp1);
-			free(tmp2);
-			free(tmp3);
-			free(tmp4);
-			if (needs_dir_free) free(dir_inode);
-
-			return -EIO;
-		}
-
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-		if (needs_dir_free) free(dir_inode);
-
-		return 0;
-	}
-
-	// new path exists
-	// remove new's entry
-	// make new's entry point to old's inode
-	
-	// Check sticky behavior on both new dir and the item
-	if (STICKY_MODE(dir_inode->mode)) {
-		if (ctx->uid != dir_inode->uid && ctx->uid != new.uid && ctx->uid != 0) {
-			return -EPERM;
+				return res;
+			}
 		}
 	}
 
-	// Check if types are compatible
-	if ((old_inode.type == S_IFDIR && new.type != S_IFDIR) || (old_inode.type != S_IFDIR && new.type == S_IFDIR)) {
-		perror("Cannot rename from a directory to a non-directory entity");
+	uint32_t s = source_parent.size;
 
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-		if (needs_dir_free) free(dir_inode);
+	// Remove source entry from source parent
+	if ((res = dir_remove(&source_parent, &source_inode, source_base)) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-		return -EISDIR;
+		return res;
 	}
 
-	// Remove new's entry
-	if (dir_remove(dir_inode, &new, base) < 0) {
-		perror("Cannot remove entry");
+	// Add new entry into target parent
+	uint32_t a = target_parent.size;
 
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-		if (needs_dir_free) free(dir_inode);
+	if ((res = dir_add(&target_parent, source_inode.ino, target_base, strlen(target_base))) < 0) {
+		free_split_path(&source_p);
+		free_split_path(&target_p);
 
-		return -EIO;
+		return res;
 	}
 
-	// Create new now point to old's inode but in new's dir
-	if (dir_add(dir_inode, old_inode.ino, base, strlen(base)) < 0) {
-		perror("Cannot add entry");
+	// If cross directory rename
+	// then update ".." to point to target dir
+	if (IS_DIR(source_inode) && source_parent.ino != target_parent.ino) {
+		if ((res = dir_update_dotdot(&source_inode, &target_parent)) < 0) {
+			free_split_path(&source_p);
+			free_split_path(&target_p);
 
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-		if (needs_dir_free) free(dir_inode);
-
-		return -EIO;
+			return res;
+		}
 	}
 
-	// Remove old's entry
-	if (dir_remove(&old_dir_inode, &old_inode, old_base) < 0) {
-		perror("Cannot remove entry");
-
-		free(tmp1);
-		free(tmp2);
-		free(tmp3);
-		free(tmp4);
-		if (needs_dir_free) free(dir_inode);
-
-		return -EIO;
-	}
-
-	free(tmp1);
-	free(tmp2);
-	free(tmp3);
-	free(tmp4);
-	if (needs_dir_free) free(dir_inode);
+	free_split_path(&source_p);
+	free_split_path(&target_p);
 
 	return 0;
 }
@@ -2587,34 +2954,25 @@ static int myfs_rmdir(const char* path) {
 
 	// Can only delete empty dir
 	// Check if dir is empty
-	if (dir_inode.size > 2 * sizeof(struct dirent)) {
-		printf("\tDir ino: %d is not empty - Currently has: %d items\n", dir_inode.ino, dir_inode.size / sizeof(struct dirent));
-		
+	if (dir_entry_count(&dir_inode) > 2) {
 		return -ENOTEMPTY;
 	}
 
 	printf("\tdir is a valid empty directory\n");
 
-	char* tmp1 = strdup(path);
-	char* tmp2 = strdup(path);
+	struct path_split p = { 0 };
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
+	if (split_path(path, &p) < 0) return -ENOMEM;
 
-		return -ENOSPC;
-	}
-
-	char* base = basename(tmp1);
-	char* dir = dirname(tmp2);
+	char* base = p.base;
+	char* dir = p.dir;
 
 	struct inode parent_inode = { 0 };
 
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
 		perror("Cannot read inode");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -ENOENT;
 	}
@@ -2629,8 +2987,7 @@ static int myfs_rmdir(const char* path) {
 	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EACCES;
 	}
@@ -2639,8 +2996,7 @@ static int myfs_rmdir(const char* path) {
 	// owner of the parent dir of the being deleted entry or root can perform rmdir
 	if (parent_inode.mode & S_ISVTX) {
 		if (ctx->uid != parent_inode.uid && ctx->uid != dir_inode.uid && ctx->uid != 0) {
-			free(tmp1);
-			free(tmp2);
+			free_split_path(&p);
 
 			return -EPERM;
 		}
@@ -2650,56 +3006,22 @@ static int myfs_rmdir(const char* path) {
 	if (dir_remove(&parent_inode, &dir_inode, base) < 0) {
 		perror("Cannot remove dir entry from parent");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EIO;
 	}
 
-	free(tmp1);
-	free(tmp2);
+	// Update parent nlink
+	parent_inode.nlink--;
+
+	if (write_inode(parent_inode.ino, &parent_inode) < 0) {
+		return -EIO;
+	}
+
+	free_split_path(&p);
 
 	// reset data block if it has any allocated data blocks
-	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
-		if (dir_inode.directs[i] < 0) continue;;
-
-		if (reset_data_block(dir_inode.directs[i]) < 0) {
-			perror("Cannot reset data block");
-
-			return -EIO;
-		}
-	}
-
-	if (dir_inode.indirect_ptr >= 0) {
-		int* buf = (int*)malloc(BLOCK_SIZE);
-		int num_blk = BLOCK_SIZE / sizeof(int);
-
-		if (buf == NULL) {
-			return -ENOSPC;
-		}
-
-		if (block_read(dir_inode.indirect_ptr, buf) < 0) {
-			perror("Cannot read block");
-
-			return -EIO;
-		}
-
-		for (int i = 0; i < num_blk; ++i) {
-			if (buf[i] < 0) continue;
-
-			if (reset_data_block(buf[i]) < 0) {
-				perror("Cannot reset data block");
-
-				return -EIO;
-			}
-		}
-
-		printf("\tReset data block indirects\n");
-	}
-
 	if (reset_ino(dir_inode.ino) < 0) {
-		perror("Cannot reset inode");
-
 		return -EIO;
 	}
 
@@ -2742,8 +3064,9 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 		return -EIO;
 	}
 
-	// Simply remove fi->fh cache
 	fi->fh = 0;
+
+	free((void*)fi->fh);
 
 	printf("[myfs_releasedir] Done.\n\n");
 
@@ -2777,26 +3100,19 @@ static int myfs_unlink(const char* path) {
 
 	printf("\t File is a valid file to be removed\n");
 
-	char* tmp1 = strdup(path);
-	char* tmp2 = strdup(path);
+	struct path_split p = { 0 };
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
+	if (split_path(path, &p) < 0) return -ENOMEM;
 
-		return -ENOSPC;
-	}
-
-	char* base = basename(tmp1);
-	char* dir = dirname(tmp2);
+	char* base = p.base;
+	char* dir = p.dir;
 
 	struct inode parent_inode = { 0 };
 
 	if (get_node_by_path(dir, ROOT_INO, &parent_inode) < 0) {
 		perror("Cannot read inode");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -ENOENT;
 	}
@@ -2825,22 +3141,29 @@ static int myfs_unlink(const char* path) {
 	if (dir_remove(&parent_inode, &f_inode, base) < 0) { //
 		perror("Cannot remove file entry from parent");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&p);
 
 		return -EIO;
 	}
 
-	free(tmp1);
-	free(tmp2);
+	// Update nlink of f_inode
+	f_inode.nlink--;
+
+	if (write_inode(f_inode.ino, &f_inode) < 0) {
+		free_split_path(&p);
+		
+		return -EIO;
+	}
+
+	free_split_path(&p);
 
 	// Check if nlink == 0 && open count == 0
 	// If nlink is 0 and open count is 0, remove the file content
 	// Simply returns its data blocks back to the file system
-	printf("\tIno: %d -- nlink = %u | open count = %u\n", f_inode.nlink, f_inode.open_count);
+	printf("\tino: %ld -- nlink = %u | open count = %u\n", f_inode.nlink, f_inode.open_count);
 	
 	if (f_inode.nlink <= 0 && f_inode.open_count <= 0) {
-		printf("\tFile ino: %d has 0 nlink, remove its data blocks\n", f_inode.ino);
+		printf("\tFile ino: %ld has 0 nlink, remove its data blocks\n", f_inode.ino);
 
 		for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
 			if (f_inode.directs[i] >= 0) {
@@ -2916,7 +3239,7 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 	if (fi != NULL && fi->fh != 0) {
 		fh = (struct file_handler*)fi->fh;
 
-		printf("\tFH ino: %d\n", fh->ino);
+		printf("\tFH ino: %ld\n", fh->ino);
 
 		if (read_inode(fh->ino, &f_inode) == -1) {
 			return -ENOENT;
@@ -3230,7 +3553,7 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 
 	assert(fh != NULL);
 
-	printf("\tFH ino: %d\n", fh->ino);
+	printf("\tFH ino: %ld\n", fh->ino);
 
 	if (read_inode(fh->ino, &finode) < 0) {
 		perror("Cannot read inode");
@@ -3248,10 +3571,10 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 
 		return -EIO;
 	}
+	
+	free((void*)fi->fh);
 
 	fi->fh = 0;
-	
-	free(fi->fh);
 
 	printf("[myfs_release] Done.\n\n");
 
@@ -3262,7 +3585,7 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 	assert(path != NULL);
 	assert(ROOT_INO != -1);
 
-	printf("[myfs_fallocate] path: %s | mode = %d | offset: %u | len: %lu\n", path, mode, offset, len);
+	printf("[myfs_fallocate] path: %s | mode = %d | offset: %lu | len: %lu\n", path, mode, offset, len);
 
 	struct inode finode = { 0 }; 
 
@@ -3273,7 +3596,7 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 
 		assert(fh != NULL);
 
-		printf("\tFH ino: %d\n", fh->ino);
+		printf("\tFH ino: %ld\n", fh->ino);
 
 		if (read_inode(fh->ino, &finode) < 0) {
 			perror("Cannot read inode");
@@ -3297,7 +3620,7 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 
 	for (int i = start_blk_idx; i <= end_blk_idx; ++i) {
 		if (finode.directs[i] >= 0) {
-			printf("\tIno: %d | blk idx: %d | block: %d has been allocated before\n", finode.ino, i, finode.directs[i]);
+			printf("\tIno: %ld | blk idx: %d | block: %d has been allocated before\n", finode.ino, i, finode.directs[i]);
 
 			// Already assigned
 			continue;
@@ -3314,7 +3637,7 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 
 		finode.directs[i] = blk;
 
-		printf("\tIno: %d | blk idx: %d | block: %d has been assigned\n", finode.ino, i, blk);
+		printf("\tIno: %ld | blk idx: %d | block: %d has been assigned\n", finode.ino, i, blk);
 	}
 
 	// Save changes in inode
@@ -3430,7 +3753,7 @@ static int myfs_symlink(const char* target, const char* link) {
 		return -EACCES;
 	}
 
-	struct inode new_file_inode = make_inode(ino, __S_IFLNK, 0755, 0, ctx->uid, ctx->gid);
+	struct inode new_file_inode = make_inode(ino, __S_IFLNK, 0755, 1, ctx->uid, ctx->gid);
 
 	if (write_inode(ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
@@ -3441,7 +3764,7 @@ static int myfs_symlink(const char* target, const char* link) {
 		return -EIO;
 	}
 
-	printf("\tWrote file inode ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+	printf("\tWrote file inode ino: %ld to parent ino: %ld\n", ino, parent_inode.ino);
 
 	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
 		perror("Cannot add dirent entry");
@@ -3452,7 +3775,7 @@ static int myfs_symlink(const char* target, const char* link) {
 		return -EIO;
 	}
 
-	printf("\tAdded file entry ino: %d to parent ino: %d\n", ino, parent_inode.ino);
+	printf("\tAdded file entry ino: %ld to parent ino: %ld\n", ino, parent_inode.ino);
 
 	printf("\tWriting file path to symlink\n");
 
@@ -3529,31 +3852,13 @@ static int myfs_link(const char* target, const char* link) {
 
 	printf("[myfs_link] target: %s | link: %s\n", target, link);
 	
-	char *tmp1, *tmp2;
+	struct path_split link_path = { 0 };
 
-	tmp1 = strdup(link);
-	tmp2 = strdup(link);
+	if (split_path(link, &link_path) < 0) return -ENOMEM;
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		perror("Cannot allocate memory");
+	char *base = link_path.base;
 
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-
-		return -ENOSPC;
-	}
-
-	char *base = basename(tmp1);
-	char *dir = dirname(tmp2);
-
-	// if (base == NULL || dir == NULL) {
-	// 	perror("Cannot allocate memory");
-
-	// 	if (base) free(base);
-	// 	if (dir) free(dir);
-
-	// 	return -ENOSPC;
-	// }
+	char *dir = link_path.dir;
 
 	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
 
@@ -3562,15 +3867,13 @@ static int myfs_link(const char* target, const char* link) {
 	int node_res;
 
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&link_path);
 
 		return node_res;
 	}
 
 	if (parent_inode.valid == 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&link_path);
 
 		return -ENOENT;
 	}
@@ -3583,31 +3886,39 @@ static int myfs_link(const char* target, const char* link) {
 	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		free_split_path(&link_path);
+
 		return -EACCES;
 	}
 
 	struct inode target_inode = { 0 };
 
 	if ((node_res = get_node_by_path(target, ROOT_INO, &target_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&link_path);
 
 		return node_res;
 	}
 
-	printf("\tTarget ino for hard link is: %d\n", target_inode.ino);
+	printf("\tTarget ino for hard link is: %ld\n", target_inode.ino);
 
 	if (dir_add(&parent_inode, target_inode.ino, base, strlen(base)) < 0) {
 		perror("Cannot add entry to directory");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&link_path);
 
 		return -EIO;
 	}
 
-	free(tmp1);
-	free(tmp2);
+	// Update target nlink
+	target_inode.nlink++;
+
+	if (write_inode(target_inode.ino, &target_inode) < 0) {
+		free_split_path(&link_path);
+		
+		return -EIO;
+	}
+
+	free_split_path(&link_path);
 
 	printf("[myfs_link] Done.\n\n");
 
@@ -3705,7 +4016,7 @@ static int myfs_access(const char* path, int mode) {
 		return -ENOENT;
 	}
 
-	printf("\tIno: %d\n", item.ino);
+	printf("\tIno: %ld\n", item.ino);
 
 	if (mode == F_OK) {
 		// The user wants to know if the file exists
@@ -3781,7 +4092,7 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 		return node_res;
 	}
 
-	printf("\tIno: %d | uid: %d | gid: %d\n", item.ino, uid, gid);
+	printf("\tIno: %ld | uid: %d | gid: %d\n", item.ino, uid, gid);
 
 	// chmod if:
 	// - user is the owner of the file
@@ -3868,8 +4179,6 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 	uid_t uuid = ctx->uid;
 	gid_t ggid = ctx->gid;
 
-	printf("\tuuid: %d | ggid: %d\n", uuid, ggid);
-
 	struct inode item = { 0 };
 
 	int node_res;
@@ -3878,23 +4187,22 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 		return node_res;
 	}
 
-	printf("\tIno: %d\n", item.ino);
-
-	if (uuid != uid) {
-		// Changing uid
+	if (uid != (uid_t)-1 && uid != item.uid) {
+		// User wish to change uid
 		// Only root can change uid
-		if (uuid != 0) return -EPERM;
+		if (!IS_ROOT(uuid)) return -EPERM;
 	}
 
-	if (ggid != gid) {
-		// Changing gid
+	if (gid != (gid_t)-1 && gid != item.gid) {
+		// User wish to change gid
+
 		// Root can change gid
 		// Non-root user can change gid if:
 		// - User owns the file AND the group of this item belongs to the user's groups
 		// Since FUSE does not provide the list of groups that user belongs to
 		// I gotta skip that condition and only check for primary group
-		if (uuid != 0) {
-			// If user is non-root
+		
+		if (!IS_ROOT(uuid)) {
 			if (uuid != item.uid || ggid != item.gid) {
 				return -EPERM;
 			}
