@@ -36,8 +36,8 @@
 
 struct superblock {
 	uint16_t magic_num;			// magic number used to identify if a storage file is valid
-	uint16_t max_inum; 			// max number of inodes
-	uint16_t max_dnum; 			// max number of data blocks
+	uint32_t max_inum; 			// max number of inodes
+	uint32_t max_dnum; 			// max number of data blocks
 	uint32_t i_bitmap_blk; 		// start block of inode bitmap
 	uint32_t d_bitmap_blk; 		// start block of data bitmap
 	uint32_t i_start_blk; 		// start block of inode region					  					  			
@@ -48,7 +48,7 @@ struct superblock {
 
 struct inode {
 	ino_t ino;				// inode number
-	uint16_t container_ino;		// inode number of parent
+	ino_t container_ino;		// inode number of parent
 	uint16_t valid;				// bit check if inode is valid
 	uint32_t size;				// size of the file
 	uint32_t type;				// type of the file
@@ -75,8 +75,14 @@ struct dirent {
 };
 
 struct file_handler {
-	uint16_t ino;
+	ino_t ino;
 	int flags;	
+};
+
+struct path_split {
+	char *buf;
+	char *dir;
+	char *base;
 };
 
 /**
