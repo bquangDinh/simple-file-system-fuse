@@ -28,7 +28,7 @@
 // Maximum number of data blocks in data region
 // Each data block occupies one page
 // Beware that the total number of inodes + data + inode bitmap (one page) + data bitmap (one page) + superblock (one page) must be <= the size of file
-#define MAX_DATA_NUM 244140 // For 10GB file
+#define MAX_DATA_NUM 7165 // For 32MB file
 
 #define INODE_BITMAP_BYTES ((MAX_INODE_NUM + 7) / 8) // in bytes
 #define DATA_BITMAP_BYTES ((MAX_DATA_NUM + 7) / 8) // in bytes													 									  

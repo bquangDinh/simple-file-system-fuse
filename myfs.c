@@ -13,6 +13,7 @@
 #include <sys/time.h>
 #include <math.h>
 #include <stdbool.h>
+#include <pthread.h>
 
 // Provide some simple file path extractions such as basename, filename, etc
 #include <libgen.h>
@@ -45,20 +46,49 @@
 /**
  * Helper macros
  */
+/**
+ * Fill an array with the given value
+ */
 #define ARRAY_FILL(arr, value, len) \
 	for (size_t i = 0; i < len; ++i) \
 		(arr)[i] = (value)
 
+/**
+ * Free the list of pointers
+ */
 #define FREE_ALL(...) do { \
 	void *ptrs[] = { __VA_ARGS__ }; \
 	for (size_t i = 0; i < sizeof(ptrs) / sizeof(ptrs[0]); i++) \
 		free(ptrs[i]); \
-} while (0);
+} while (0)
+
+#define RD_LOCK(m, op) do { \
+	fprintf(thread_log_fd, "[%s] RD LOCK %s %p thread_id=%lu at %s:%d\n", \
+	op, #m, (void*)(m), (unsigned long)pthread_self(), __FILE__, __LINE__); \
+	fflush(thread_log_fd); \
+	int rc = pthread_rwlock_rdlock((m)); \
+	if (rc) { errno = rc; perror("pthread_rwlock_rdlock"); abort(); } \
+} while (0)
+
+#define WR_LOCK(m, op) do { \
+	fprintf(thread_log_fd, "[%s] WR LOCK %s %p thread_id=%lu at %s:%d\n", \
+	op, #m, (void*)(m), (unsigned long)pthread_self(), __FILE__, __LINE__); \
+	fflush(thread_log_fd); \
+	int rc = pthread_rwlock_wrlock((m)); \
+	if (rc) { errno = rc; perror("pthread_rwlock_wrlock"); abort(); } \
+} while (0)
+
+#define UNLOCK(m) do { \
+	fprintf(thread_log_fd, "UNLOCK %s %p thread_id=%lu at %s:%d\n", \
+	#m, (void*)(m), (unsigned long)pthread_self(), __FILE__, __LINE__); \
+	fflush(thread_log_fd); \
+	int rc = pthread_rwlock_unlock((m)); \
+	if (rc) { errno = rc; perror("pthread_rwlock_unlock"); abort(); } \
+} while (0)
 
 #define IS_STR_EMPTY(str) (strcmp(str, "") == 0)
 #define IS_DIR(inode) ((inode).type == S_IFDIR)
 #define IS_DIR_STICKY(inode) ((inode).mode & S_ISVTX)
-
 #define IS_ROOT(uid) (uid == 0)
 
 /**
@@ -69,27 +99,55 @@
 #define PERM_CAN_EXECUTE(perm) (perm & 1)
 #define STICKY_MODE(mode) (mode & S_ISVTX)
 
+/**
+ * Locks
+ */
+#define MAX_INODE_LOCKS 1024
+pthread_rwlock_t inode_locks[MAX_INODE_LOCKS] = {
+	[0 ... MAX_INODE_LOCKS - 1] = PTHREAD_RWLOCK_INITIALIZER
+};
+pthread_mutex_t inode_bitmap_lock = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t data_bitmap_lock = PTHREAD_MUTEX_INITIALIZER;
+
 char diskfile_path[PATH_MAX];
 
 struct superblock* superblock = NULL;
 int ROOT_INO = 1;
 bool SUPERBLOCK_EXISTED = false;
+FILE* thread_log_fd = NULL;
+
 
 // --------------------- HELPER FUNCTIONS ------------------------------
+/**
+ * Extract user permission bits
+ */
 mode_t get_user_perm(mode_t mode) {
 	return (mode >> 6) & 7;
 }
 
+/**
+ * Extract group permission bits
+ */
 mode_t get_group_perm(mode_t mode) {
 	return (mode >> 3) & 7;
 }
 
+/**
+ * Extract other permission bits
+ */
 mode_t get_other_perm(mode_t mode) {
 	return mode & 7;
 }
 
-mode_t get_perm_by_inode(uid_t uid, gid_t gid, const struct inode* inode) {
+mode_t get_perm_by_inode(const struct inode* inode) {
 	assert(inode != NULL);
+
+	struct fuse_context* ctx = fuse_get_context();
+
+	assert(ctx != NULL);
+
+	uid_t uid = ctx->uid;
+	gid_t gid = ctx->gid;
 
 	mode_t perm;
 
@@ -102,12 +160,6 @@ mode_t get_perm_by_inode(uid_t uid, gid_t gid, const struct inode* inode) {
 	}
 
 	return perm;
-}
-
-static inline void dump_str(const char*s, size_t len) {
-	for (size_t i = 0; i < len; ++i) printf("%02x", (unsigned char)s[i]);
-
-	printf("\n");
 }
 
 static inline struct timespec now(void) {
@@ -181,6 +233,13 @@ static void free_split_path(struct path_split* p) {
 	if (p && p->buf) free(p->buf);
 }
 
+/**
+ * Check if a given inode has the requested permissions
+ * "req" is the string in format of "r" or "rw" or "w", etc
+ * each letter represents READ ('r'), WRITE ('w') or EXECUTE ('x') permission
+ * The function check if the given inode has the COMBINATION of permissions, not invidually
+ * So while an inode may has "w" permit, does not mean it has "rw" permit
+ */
 static bool check_permissions(struct inode* i, const char* req) {
 	assert(i != NULL);
 	assert(req != NULL);
@@ -194,7 +253,7 @@ static bool check_permissions(struct inode* i, const char* req) {
 	uid_t uid = ctx->uid;
 	gid_t gid = ctx->gid;
 
-	mode_t perm = get_perm_by_inode(uid, gid, i);
+	mode_t perm = get_perm_by_inode(i);
 
 	printf("\tPerm: %05o\n", i->mode & 07777);
 
@@ -215,6 +274,10 @@ static bool check_permissions(struct inode* i, const char* req) {
 
 	return true;
 }
+
+static inline pthread_rwlock_t* get_inode_lock(ino_t ino) {
+	return &inode_locks[ino % MAX_INODE_LOCKS];
+}
 // -----------------------------------------------------------------------
 
 /**
@@ -225,6 +288,8 @@ int get_avail_ino() {
 	assert(superblock != NULL);
 
 	printf("[get_avail_ino]\n");
+
+	pthread_mutex_lock(&inode_bitmap_lock);
 
 	int inode_bitmap_blocks = superblock->d_bitmap_blk - superblock->i_bitmap_blk;
 
@@ -241,14 +306,18 @@ int get_avail_ino() {
 	if (bitmap == NULL) {
 		perror("Cannot allocate memory");
 
+		pthread_mutex_unlock(&inode_bitmap_lock);
+
 		return -ENOSPC;
 	}
 
 	for (int i = 0; i < inode_bitmap_blocks; ++i) {
 		if (block_read(superblock->i_bitmap_blk + i, bitmap) < 0) {
-			perror("Cannot read block");
-
 			free(bitmap);
+
+			pthread_mutex_unlock(&inode_bitmap_lock);
+
+			perror("Cannot read block");
 
 			return -EIO;
 		}
@@ -271,6 +340,8 @@ int get_avail_ino() {
 
 					free(bitmap);
 
+					pthread_mutex_unlock(&inode_bitmap_lock);
+
 					return -EIO;
 				}
 
@@ -284,12 +355,16 @@ int get_avail_ino() {
 
 					free(bitmap);
 
+					pthread_mutex_unlock(&inode_bitmap_lock);
+
 					return -EIO;
 				}
 
 				printf("\tUpdated superblock count of free inode. Total free inode: %d\n", superblock->free_ino_count);
 
 				free(bitmap);
+
+				pthread_mutex_unlock(&inode_bitmap_lock);
 
 				printf("[get_avail_ino] Done.\n\n");
 
@@ -299,6 +374,8 @@ int get_avail_ino() {
 	}
 
 	free(bitmap);
+
+	pthread_mutex_unlock(&inode_bitmap_lock);
 
 	printf("[get_avail_ino] Done.\n\n");
 
@@ -313,6 +390,8 @@ int get_avail_blkno() {
 	assert(superblock != NULL);
 
 	printf("[get_avail_blkno]\n");
+
+	pthread_mutex_lock(&data_bitmap_lock);
 
 	int data_bitmap_blocks = superblock->i_start_blk - superblock->d_bitmap_blk;
 
@@ -329,6 +408,8 @@ int get_avail_blkno() {
 	if (bitmap == NULL) {
 		perror("Cannot allocate memory");
 
+		pthread_mutex_unlock(&data_bitmap_lock);
+
 		return -ENOSPC;
 	}
 
@@ -337,6 +418,8 @@ int get_avail_blkno() {
 			perror("Cannot read block");
 
 			free(bitmap);
+
+			pthread_mutex_unlock(&data_bitmap_lock);
 
 			return -EIO;
 		}
@@ -359,6 +442,8 @@ int get_avail_blkno() {
 
 					free(bitmap);
 
+					pthread_mutex_unlock(&data_bitmap_lock);
+
 					return -EIO;
 				}
 
@@ -371,6 +456,8 @@ int get_avail_blkno() {
 
 					free(bitmap);
 
+					pthread_mutex_unlock(&data_bitmap_lock);
+
 					return -EIO;
 				}
 
@@ -382,12 +469,16 @@ int get_avail_blkno() {
 
 				free(bitmap);
 
+				pthread_mutex_unlock(&data_bitmap_lock);
+
 				return j + superblock->d_start_blk;
 			}
 		}
 	}
 
 	free(bitmap);
+
+	pthread_mutex_unlock(&data_bitmap_lock);
 
 	printf("[get_avail_blkno] Done.\n\n");
 
@@ -421,7 +512,7 @@ int read_inode(ino_t ino, struct inode* inode) {
 
 	if (block_read(block_index + offset, inode_table) < 0) {
 		perror("Cannot read block");
-
+		
 		free(inode_table);
 
 		return -EIO;
@@ -703,9 +794,9 @@ int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* diren
 	assert(fname != NULL);
 	assert(name_len > 0);
 	assert(ino < superblock->max_inum);
-	
+
 	struct inode dir_inode = { 0 };
-	
+
 	if (read_inode(ino, &dir_inode) < 0) {
 		perror("dir_find");
 
@@ -713,12 +804,6 @@ int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* diren
 	}
 
 	printf("\tRead inode [%d]\n", ino);
-
-	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
-	
-	int total_dirents = dir_inode.size / sizeof(struct dirent);
-
-	printf("\tNum entries per block: %d | Total: %d\n", num_entries_per_block, total_dirents);
 
 	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 
@@ -728,11 +813,13 @@ int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* diren
 		return -ENOMEM;
 	}	
 
-	// int total_dirents_read = 0;
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
+	
+	int total_dirents = dir_inode.size / sizeof(struct dirent);
+
+	printf("\tNum entries per block: %d | Total: %d\n", num_entries_per_block, total_dirents);
 
 	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
-		// if (total_dirents_read == total_dirents) break;
-
 		if (dir_inode.directs[i] < 0) continue;
 
 		if (block_read(dir_inode.directs[i], buffer) < 0) {
@@ -744,8 +831,6 @@ int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* diren
 		}
 
 		for (int j = 0; j < num_entries_per_block; ++j) {
-			// if (total_dirents_read == total_dirents) break;
-
 			if (buffer[j].valid == 1) {
 				printf("\t\tChecking item[%d]: %s at block %d\n", j, buffer[j].name, dir_inode.directs[i]);
 				
@@ -763,8 +848,6 @@ int dir_find(ino_t ino, const char* fname, size_t name_len, struct dirent* diren
 					return 0;
 				}
 			}
-
-			// total_dirents_read++;
 		}
 	}
 
@@ -788,7 +871,7 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 	assert(f_ino < superblock->max_inum);
 	assert(fname != NULL);
 	assert(name_len > 0);
-
+	
 	if (dir_find(dir_inode->ino, fname, name_len, NULL) == 0) {
 		return -EEXIST;
 	}
@@ -806,9 +889,9 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 	if (buffer == NULL) {
 		perror("Cannot allocate memory");
 
-		return -ENOSPC;
+		return -ENOMEM;
 	}
-	
+
 	// Find the first free slot or append it at the end
 	int block_idx = 0;
 
@@ -844,8 +927,6 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 				buffer[i].len = name_len;
 
 				printf("\tItem name: %s\n", buffer[i].name);
-				// printf("\t\tDump: ");
-				// dump_str(buffer[i].name, name_len + 1);
 
 				if (block_write(dir_inode->directs[block_idx], buffer) < 0) {
 					perror("Cannot write block");
@@ -854,22 +935,10 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 
 					return -EIO;
 				}
-				
-				// Update size
-				// dir_inode->size += sizeof(struct dirent);
 
 				// Update mtime
 				dir_inode->mtime = now();
 				
-				// printf("\tUpdated parent dir ino %d size to: %u\n", dir_inode->ino, dir_inode->size);
-
-				// num nlink of dir = 2 + num sub directories
-				// if (f_inode.type == S_IFDIR) {
-				// 	dir_inode->nlink++;
-				// }
-
-				// printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
-
 				if (write_inode(dir_inode->ino, dir_inode) < 0) {
 					perror("Cannot write inode");
 
@@ -877,24 +946,6 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 
 					return -EIO;
 				}
-				
-				// // Update link count of target ino
-				// // To prevent dir_add adding itself
-				// if (f_ino != dir_inode->ino) {
-				// 	f_inode.nlink++;
-
-				// 	printf("\tUpdated nlink of ino: %ld to %d\n", f_inode.ino, f_inode.nlink);
-
-				// 	if (write_inode(f_ino, &f_inode) == -1) {
-				// 		perror("Cannot write inode");
-
-				// 		free(buffer);
-
-				// 		return -EIO;
-				// 	}
-
-				// 	printf("\tUpdated entry ino: %ld nlink to %d\n", f_inode.ino, f_inode.nlink);
-				// }
 
 				free(buffer);
 
@@ -931,8 +982,6 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 	buffer[0].len = name_len;
 
 	printf("\tItem name: %s\n", buffer[0].name);
-	// printf("\t\tDump: ");
-	// dump_str(buffer[0].name, name_len + 1);
 
 	if (block_write(data_block_idx, buffer) < 0) {
 		perror("Cannot write data block");
@@ -948,13 +997,6 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 
 	printf("\tUpdated dir size to: %u\n", dir_inode->size);
 
-	// // num nlink of dir = 2 + num sub directories
-	// if (f_inode.type == S_IFDIR) {
-	// 	dir_inode->nlink++;
-	// }
-
-	// printf("\tUpdated parent dir %d nlink to %d\n", dir_inode->ino, dir_inode->nlink);
-
 	if (write_inode(dir_inode->ino, dir_inode) < 0) {
 		perror("Cannot write inode");
 
@@ -964,23 +1006,6 @@ int dir_add(struct inode* dir_inode, ino_t f_ino, const char* fname, size_t name
 	}
 
 	printf("\tWrote parent inode update\n");
-
-	// // Update link count of target ino
-	// if (f_ino != dir_inode->ino) {
-	// 	printf("\tf_ino = %d | dir ino = %d\n", f_ino, dir_inode->ino);
-
-	// 	f_inode.nlink++;
-
-	// 	if (write_inode(f_ino, &f_inode) == -1) {
-	// 		perror("Cannot write inode");
-
-	// 		free(buffer);
-
-	// 		return -EIO;
-	// 	}
-
-	// 	printf("\tUpdated entry ino: %ld nlink to %d\n", f_inode.ino, f_inode.nlink);
-	// }
 
 	free(buffer);
 
@@ -1001,12 +1026,6 @@ int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const c
 
 	printf("[dir_remove] parent ino: %ld about to remove (-> ino: %ld): %s\n", dir_inode->ino, entry_inode->ino, fname);
 
-	// int num_entry = dir_inode->size / sizeof(struct dirent);
-
-	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
-	
-	printf("\tNum entries per block: %d\n", num_entries_per_block);
-
 	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 
 	if (buffer == NULL) {
@@ -1014,6 +1033,10 @@ int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const c
 
 		return -ENOMEM;
 	}
+
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
+	
+	printf("\tNum entries per block: %d\n", num_entries_per_block);
 
 	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
 		if (dir_inode->directs[i] < 0) continue;
@@ -1041,18 +1064,11 @@ int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const c
 					perror("Cannot write block");
 
 					free(buffer);
-
+					
 					return -EIO;
 				}
 
 				dir_inode->mtime = now();
-
-				// if (entry_inode->type == S_IFDIR) {
-				// 	dir_inode->nlink--;
-				// } else {
-				// 	// Update nlink of target inode
-				// 	entry_inode->nlink--;
-				// }
 
 				if (write_inode(dir_inode->ino, dir_inode) < 0) {
 					perror("Cannot write inode");
@@ -1061,14 +1077,6 @@ int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const c
 
 					return -EIO;
 				}
-
-				// if (write_inode(entry_inode->ino, entry_inode) < 0) {
-				// 	perror("Cannot write inode");
-
-				// 	return -EIO;
-				// }
-
-				// printf("\tUpdated nlink of target ino: %ld to be = %d\n", entry_inode->ino, entry_inode->nlink);
 
 				printf("[dir_remove] Done.\n\n");
 
@@ -1088,8 +1096,6 @@ int dir_remove(struct inode* dir_inode, const struct inode* entry_inode, const c
 }
 
 int dir_entry_count(struct inode* dir_inode) {
-	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
-
 	struct dirent* buffer = (struct dirent*)malloc(BLOCK_SIZE);
 
 	if (buffer == NULL) {
@@ -1097,6 +1103,8 @@ int dir_entry_count(struct inode* dir_inode) {
 
 		return -ENOMEM;
 	}
+
+	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
 
 	int count = 0;
 
@@ -1138,8 +1146,6 @@ int dir_update_dotdot(struct inode* dir_inode, struct inode* new_parent) {
 	int num_entries_per_block = BLOCK_SIZE / sizeof(struct dirent);
 
 	for (int i = 0; i < DIRECT_PTRS_COUNT; ++i) {
-		// if (total_dirents_read == total_dirents) break;
-
 		if (dir_inode->directs[i] < 0) continue;
 
 		if (block_read(dir_inode->directs[i], buffer) < 0) {
@@ -1201,7 +1207,7 @@ int dir_update_dotdot(struct inode* dir_inode, struct inode* new_parent) {
 					}
 
 					free(buffer);
-	
+					
 					printf("[dir_update_dotdot] Done.\n\n");
 	
 					return 0;
@@ -1211,7 +1217,7 @@ int dir_update_dotdot(struct inode* dir_inode, struct inode* new_parent) {
 	}
 
 	free(buffer);
-	
+
 	printf("\tCannot find '..'. Something went wrong!\n");
 
 	printf("[dir_update_dotdot] Done.\n\n");
@@ -1239,17 +1245,15 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 	
 	mode_t perm;
 
-	char *tmp1 = strdup(path);
+	struct path_split p = { 0 };
 
-	if (tmp1 == NULL) {
-		perror("Cannot allocate memory");
+	if (split_path(path, &p) < 0) return -ENOMEM;
 
-		return -ENOSPC;
-	}	
+	char* base = p.base;
 
-	char* base = basename(tmp1);
-
-	if (strlen(base) > NAME_MAX) return -ENAMETOOLONG;
+	if (strlen(base) > NAME_MAX) {
+		return -ENAMETOOLONG;
+	}
 
 	printf("\tBase: %s\n", base);
 
@@ -1257,11 +1261,21 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 	struct dirent dir_entry = { 0 };
 
 	if (read_inode(ino, &current) < 0) {
+		free_split_path(&p);
+
 		return -EIO;
 	}
 
 	char* path_clone = strdup(path);
-	char* token = strtok(path_clone, "/");
+
+	if (path_clone == NULL) {
+		free_split_path(&p);
+
+		return -ENOMEM;
+	}
+
+	char* save_ptr;
+	char* token = strtok_r(path_clone, "/", &save_ptr);
 	int token_len = 0;
 
 	while (token) {
@@ -1272,7 +1286,7 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 			// Cannot traverse a file
 			if (current.type != S_IFDIR) {
 				free(path_clone);
-				free(tmp1);
+				free_split_path(&p);
 
 				return -ENOTDIR;
 			}
@@ -1283,12 +1297,12 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 		// Check if we have "x" permission to traverse this dir
 		printf("\tTraversing dir ino: %ld | current token is: %s | Perm: %05o\n", current.ino, token, current.mode);
 
-		perm = get_perm_by_inode(uid, gid, &current);
+		perm = get_perm_by_inode(&current);
 
 		// Check if perm has "execute" bit
-		if (!PERM_CAN_EXECUTE(perm) && uid != 0) {
+		if (!PERM_CAN_EXECUTE(perm) && !IS_ROOT(uid)) {
 			free(path_clone);
-			free(tmp1);
+			free_split_path(&p);
 
 			return -EACCES;
 		}
@@ -1296,7 +1310,7 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 		// Now consider token
 		if (token_len > NAME_MAX) {
 			free(path_clone);
-			free(tmp1);
+			free_split_path(&p);
 
 			return -ENAMETOOLONG;
 		}
@@ -1307,7 +1321,7 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 			perror("[get_node_by_path] Item not found!");
 
 			free(path_clone);
-			free(tmp1);
+			free_split_path(&p);
 
 			return -ENOENT;
 		}
@@ -1317,13 +1331,13 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 		// Advance current to the next
 		if (read_inode(dir_entry.ino, &current) < 0) {
 			free(path_clone);
-			free(tmp1);
-			
+			free_split_path(&p);
+
 			return -EIO;
 		}
 
 		// Move to the next token
-		token = strtok(NULL, "/");
+		token = strtok_r(NULL, "/", &save_ptr);
 	}
 
 	printf("\tino: %ld | nlink: %d\n", current.ino, current.nlink);
@@ -1332,10 +1346,11 @@ int get_node_by_path(const char* path, ino_t ino, struct inode* inode) {
 	memcpy(inode, &current, sizeof(struct inode));
 
 	free(path_clone);
-	free(tmp1);
+
+	free_split_path(&p);
 
 	printf("[get_node_by_path] Done.\n\n");
-		
+	
 	return 0;
 }
 
@@ -1372,6 +1387,8 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 	printf("[make_file] path: %s | mode: %o\n", path, mode);
 
+	pthread_rwlock_t* parent_inode_lock, *file_inode_lock;
+
 	struct path_split p = { 0 };
 
 	if (split_path(path, &p) < 0) return -ENOMEM;
@@ -1394,8 +1411,14 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 		return node_res;
 	}
 
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "make_file");
+
 	if (parent_inode.valid == 0) {
 		free_split_path(&p);
+
+		UNLOCK(parent_inode_lock);
 
 		return -ENOENT;
 	}
@@ -1403,6 +1426,8 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
 		free_split_path(&p);
+
+		UNLOCK(parent_inode_lock);
 
 		return -EEXIST;
 	}
@@ -1412,9 +1437,11 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	mode_t perm = get_perm_by_inode(&parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+		UNLOCK(parent_inode_lock);
+
 		return -EACCES;
 	}
 
@@ -1424,8 +1451,14 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	if (ino < 0) {
 		free_split_path(&p);
 
+		UNLOCK(parent_inode_lock);
+
 		return -ENOSPC;
 	}
+
+	file_inode_lock = get_inode_lock(ino);
+
+	WR_LOCK(file_inode_lock, "make_file");
 
 	if (S_ISFIFO(mode)) {
 		*(out_inode) = make_inode(ino, __S_IFIFO, mode, 1, ctx->uid, ctx->gid);
@@ -1438,6 +1471,9 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 	} else if (S_ISSOCK(mode)) {
 		*(out_inode) = make_inode(ino, __S_IFSOCK, mode, 1, ctx->uid, ctx->gid);
 	} else {
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -EOPNOTSUPP;
 	}
 
@@ -1449,6 +1485,9 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 		free_split_path(&p);
 
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -EIO;
 	}
 
@@ -1459,13 +1498,19 @@ int make_file(const char* path, mode_t mode, struct inode* out_inode) {
 
 		free_split_path(&p);
 
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -EIO;
 	}
 
 	printf("\tAdded file entry ino: %ld to parent ino: %ld\n", ino, parent_inode.ino);
 
 	free_split_path(&p);
-	
+
+	UNLOCK(parent_inode_lock);
+	UNLOCK(file_inode_lock);
+
 	printf("[make_file] Done.\n\n");
 
 	return 0;
@@ -1495,7 +1540,7 @@ int file_write(struct inode* finode, const char* buffer, size_t size, off_t offs
 	void* block_buffer = malloc(BLOCK_SIZE);
 
 	if (block_buffer == NULL) {
-		return -ENOSPC;
+		return -ENOMEM;
 	}
 
 	while (remaining > 0) {
@@ -1580,7 +1625,7 @@ int file_write(struct inode* finode, const char* buffer, size_t size, off_t offs
 			if (indirect_buffer == NULL) {
 				free(block_buffer);
 
-				return bytes_written == 0 ? -ENOSPC : bytes_written;
+				return bytes_written == 0 ? -ENOMEM : bytes_written;
 			}
 
 			if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
@@ -1706,7 +1751,7 @@ int file_read(struct inode* finode, const char* buffer, size_t size, off_t offse
 				if (indirect_buffer == NULL) {
 					free(block_buffer);
 
-					return bytes_read == 0 ? -ENOSPC : bytes_read;
+					return bytes_read == 0 ? -ENOMEM : bytes_read;
 				}
 
 				if (block_read(finode->indirect_ptr, indirect_buffer) < 0) {
@@ -1765,7 +1810,7 @@ int init_superblock() {
 	if (superblock == NULL) {
 		perror("Cannot allocate memory");
 
-		return -ENOSPC;
+		return -ENOMEM;
 	}
 
 	printf("\tAllocated memory\n");
@@ -2000,14 +2045,6 @@ int init_inode_region() {
 		return -EIO;
 	}
 
-	struct inode test_root_inode = { 0 };
-	
-	if (read_inode(ROOT_INO, &test_root_inode) < 0) {
-		free(buffer);
-
-		return -ENOENT;
-	}
-
 	free(buffer);
 
 	printf("[init_inode_region] Done.\n\n");
@@ -2095,6 +2132,8 @@ static void myfs_destroy(void *userdata) {
 
 	dev_close();
 
+	fclose(thread_log_fd);
+
 	printf("[myfs_destroy] Done.\n\n");
 }
 
@@ -2111,8 +2150,14 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 	if ((node_res = get_node_by_path(path, ROOT_INO, &finode)) < 0) {
 		return node_res;
 	}
+
+	pthread_rwlock_t* inode_lock = get_inode_lock(finode.ino);
 	
+	RD_LOCK(inode_lock, "myfs_getattr");
+
 	if (finode.valid == 0) {
+		UNLOCK(inode_lock);
+
 		return -ENOENT;
 	}
 
@@ -2130,6 +2175,8 @@ static int myfs_getattr(const char* path, struct stat *st_buf, struct fuse_file_
 
 	printf("[myfs_getattr] Done.\n\n");
 
+	UNLOCK(inode_lock);
+
 	return 0;
 }
 
@@ -2146,7 +2193,13 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 		return node_res;
 	}
 
+	pthread_rwlock_t* inode_lock = get_inode_lock(dir_inode.ino);
+	
+	RD_LOCK(inode_lock, "opendir");
+
 	if (dir_inode.valid == 0) {
+		UNLOCK(inode_lock);
+
 		return -ENOENT;
 	}
 
@@ -2163,20 +2216,26 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	int need_write = (access_mode == O_WRONLY || access_mode == O_RDWR);
 
 	// Extract permissions from inode
-	mode_t perm = get_perm_by_inode(uid, gid, &dir_inode);
+	mode_t perm = get_perm_by_inode(&dir_inode);
 
 	// Check permission bit
 	if (need_read && !PERM_CAN_READ(perm) && uid != 0) {
+		UNLOCK(inode_lock);
+
 		return -EACCES;
 	}
 
 	if (need_write && !PERM_CAN_WRITE(perm) && uid != 0) {
+		UNLOCK(inode_lock);
+
 		return -EACCES;
 	}
 
 	dir_inode.open_count++;
 
 	if (write_inode(dir_inode.ino, &dir_inode) < 0) {
+		UNLOCK(inode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
@@ -2193,6 +2252,8 @@ static int myfs_opendir(const char* path, struct fuse_file_info *fi) {
 	fi->fh = (uint64_t)fh;
 
 	printf("[myfs_opendir] Done.\n\n");
+
+	UNLOCK(inode_lock);
 
 	return 0;
 }
@@ -2220,7 +2281,13 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 		return -ENOENT;
 	}
 
+	pthread_rwlock_t* inode_lock = get_inode_lock(dir_inode.ino);
+
+	RD_LOCK(inode_lock, "readdir");
+
 	if (dir_inode.valid == 0) {
+		UNLOCK(inode_lock);
+
 		perror("Dir is not valid");
 		return -ENOENT;
 	}
@@ -2231,6 +2298,8 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	struct dirent* block_buffer = (struct dirent*)malloc(BLOCK_SIZE);
 	
 	if (block_buffer == NULL) {
+		UNLOCK(inode_lock);
+
 		perror("Cannt allocate memory");
 
 		return -ENOSPC;
@@ -2244,13 +2313,19 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 	
 	struct stat* st_buf = (struct stat*)malloc(sizeof(struct stat));
 
-	if (st_buf == NULL) return -ENOSPC;
+	if (st_buf == NULL) {
+		UNLOCK(inode_lock);
+
+		return -ENOSPC;
+	}
 
 	// Read from direct first
 	for(; b < DIRECT_PTRS_COUNT; ++b) {
 		if (dir_inode.directs[b] < 0) continue;
 		
 		if (block_read(dir_inode.directs[b], block_buffer) < 0) {
+			UNLOCK(inode_lock);
+
 			perror("Cannot read block");
 
 			free(block_buffer);
@@ -2261,9 +2336,6 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 		for (int i = 0; i < num_dirent_per_block; ++i) {
 			entry = block_buffer[i];
 
-			// printf("\t\tDump: ");
-			// dump_str(entry.name, entry.len + 1);
-
 			if (entry.valid == 1) {
 				printf("\tItem[%d]: %s\n", i, entry.name);
 
@@ -2272,6 +2344,8 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 				st_buf->st_ino = entry.ino;
 
 				if (filler(buffer, entry.name, st_buf, 0, 0) != 0) {
+					UNLOCK(inode_lock);
+
 					perror("filler");
 					
 					free(block_buffer);
@@ -2290,6 +2364,8 @@ static int myfs_readdir(const char* path, void* buffer, fuse_fill_dir_t filler, 
 
 	printf("[myfs_readdir] Done.\n\n");
 
+	UNLOCK(inode_lock);
+
 	return 0;	
 }
 
@@ -2299,29 +2375,16 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	assert(path != NULL);
 	assert(ROOT_INO >= 0);
 
-	char *tmp1 = strdup(path);
-	char *tmp2 = strdup(path);
+	pthread_rwlock_t* parent_inode_lock, *dir_inode_lock;
 
-	if (tmp1 == NULL || tmp2 == NULL) {
-		perror("Failed to allocate memory for path");
+	struct path_split ps = { 0 };
 
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-
-		return -ENOSPC;
+	if (split_path(path, &ps) < 0) {
+		return -ENOMEM;
 	}
 
-	char *dir = dirname(tmp1);
-	char *base = basename(tmp2);
-
-	// if (dir == NULL || base == NULL) {
-	// 	perror("Unable to extract base or dir name due to space");
-
-	// 	if (dir) free(dir);
-	// 	if (base) free(base);
-
-	// 	return -ENOSPC;
-	// }
+	char *dir = ps.dir;
+	char *base = ps.base;
 
 	printf("\tDir %s | Base: %s\n", dir, base);
 
@@ -2330,20 +2393,24 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	int node_res;
 
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
+		free_split_path(&ps);
+
 		return node_res;
 	}
 
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "mkdir");
+
 	if (parent_inode.valid == 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
 
 		return -ENOENT;
 	}
 	
 	// Check if the target directory already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
 
 		return -EEXIST;
 	}
@@ -2353,9 +2420,11 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	uid_t uid = ctx->uid;
 
-	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+	mode_t perm = get_perm_by_inode(&parent_inode);
+
+	if (!PERM_CAN_WRITE(perm) && !IS_ROOT(uid)) {
 		return -EACCES;
 	}
 
@@ -2363,19 +2432,26 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	int ino = get_avail_ino();
 
 	if (ino < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
 
 		return -ENOSPC;
 	}
 
+	dir_inode_lock = get_inode_lock(ino);
+
+	WR_LOCK(dir_inode_lock, "mkdir");
+
 	struct inode new_dir_inode = make_inode(ino, S_IFDIR, mode, 2, ctx->uid, ctx->gid);
 
 	if (write_inode(ino, &new_dir_inode) < 0) {
-		perror("Cannot write inode");
+		free_split_path(&ps);
 
-		free(tmp1);
-		free(tmp2);
+		UNLOCK(parent_inode_lock);
+		UNLOCK(dir_inode_lock);
+
+		perror("Cannot write inode");
 
 		return -EIO;
 	}
@@ -2383,6 +2459,11 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	printf("\tWrote new dir inode\n");
 	
 	if (dir_add(&new_dir_inode, ino, ".", 1) < 0) {
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(dir_inode_lock);
+
 		perror("Cannot add dirent");
 
 		return -EIO;
@@ -2391,14 +2472,24 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	printf("\tWrote '.' entry to new dir inode\n");
 	
 	if (dir_add(&new_dir_inode, parent_inode.ino, "..", 2) < 0) {
-		perror("Cannot add dirent");
+		free_split_path(&ps);
 
+		UNLOCK(parent_inode_lock);
+		UNLOCK(dir_inode_lock);
+
+		perror("Cannot add dirent");
+		
 		return -EIO;
 	}
 
 	printf("\tWrote '..' entry to new dir inode\n");
 	
 	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(dir_inode_lock);
+
 		perror("Cannot add dirent");
 
 		return -EIO;
@@ -2410,11 +2501,18 @@ static int myfs_mkdir(const char* path, mode_t mode) {
 	parent_inode.nlink++;
 
 	if (write_inode(parent_inode.ino, &parent_inode) < 0) {
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(dir_inode_lock);
+
 		return -EIO;
 	}
 	
-	free(tmp1);
-	free(tmp2);
+	free_split_path(&ps);
+
+	UNLOCK(parent_inode_lock);
+	UNLOCK(dir_inode_lock);
 
 	printf("[myfs_mkdir] Done.\n\n");
 
@@ -2461,7 +2559,13 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 		return node_res;
 	}
 
+	pthread_rwlock_t* file_inode_lock = get_inode_lock(finode.ino);
+
+	WR_LOCK(file_inode_lock, "open");
+
 	if (finode.valid == 0) {
+		UNLOCK(file_inode_lock);
+
 		return -ENOENT;
 	}
 
@@ -2478,14 +2582,18 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 	int need_write = (access_mode == O_WRONLY || access_mode == O_RDWR);
 
 	// Extract permissions from inode
-	mode_t perm = get_perm_by_inode(uid, gid, &finode);
+	mode_t perm = get_perm_by_inode(&finode);
 
 	// Check permission bit
-	if (need_read && (perm & 4) == 0) {
+	if (need_read && !PERM_CAN_READ(perm)) {
+		UNLOCK(file_inode_lock);
+
 		return -EACCES;
 	}
 
-	if (need_write && (perm & 2) == 0) {
+	if (need_write && !PERM_CAN_WRITE(perm)) {
+		UNLOCK(file_inode_lock);
+
 		return -EACCES;
 	}
 
@@ -2493,6 +2601,8 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 	finode.open_count++;
 
 	if (write_inode(finode.ino, &finode) < 0) {
+		UNLOCK(file_inode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
@@ -2502,12 +2612,18 @@ static int myfs_open(const char* path, struct fuse_file_info *fi) {
 
 	struct file_handler* fh = malloc(sizeof(*fh));
 
-	if (fh == NULL) return -ENOSPC;
+	if (fh == NULL) {
+		UNLOCK(file_inode_lock);
+
+		return -ENOMEM;
+	}
 
 	fh->ino = finode.ino;
 	fh->flags = fi->flags;
 
 	fi->fh = (uint64_t)fh;
+
+	UNLOCK(file_inode_lock);
 
 	printf("[myfs_open] Done.\n\n");
 
@@ -2535,7 +2651,13 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 
 	printf("\tFH ino: %ld\n", fh->ino);
 
+	pthread_rwlock_t* file_inode_lock = get_inode_lock(fh->ino);
+
+	WR_LOCK(file_inode_lock, "read");
+
 	if (read_inode(fh->ino, &finode) < 0) {
+		UNLOCK(file_inode_lock);
+
 		perror("Cannot read inode");
 
 		return -ENOENT;
@@ -2544,12 +2666,16 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 	printf("\tRead inode with ino: %ld\n", fh->ino);
 
 	if (finode.type != __S_IFREG) {
+		UNLOCK(file_inode_lock);
+
 		perror("Not a file");
 
 		return -EISDIR;
 	}
 
 	if (finode.valid == 0) {
+		UNLOCK(file_inode_lock);
+
 		perror("File is not valid");
 
 		return -ENOENT;
@@ -2560,8 +2686,12 @@ static int myfs_read(const char* path, char* buffer, size_t size, off_t offset, 
 	int res;
 
 	if ((res = file_read(&finode, buffer, size, offset)) < 0) {
+		UNLOCK(file_inode_lock);
+
 		return res;
 	}
+
+	UNLOCK(file_inode_lock);
 
 	printf("\tBytes read: %zu\n", res);
 
@@ -2591,7 +2721,13 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 
 	printf("\tFH ino: %ld\n", fh->ino);
 
+	pthread_rwlock_t* file_inode_lock = get_inode_lock(fh->ino);
+
+	WR_LOCK(file_inode_lock, "write");
+
 	if (read_inode(fh->ino, &finode) < 0) {
+		UNLOCK(file_inode_lock);
+
 		perror("Cannot read inode");
 
 		return -ENOENT;
@@ -2600,12 +2736,16 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 	printf("\tRead inode with ino: %ld\n", fh->ino);
 
 	if (finode.type != __S_IFREG) {
+		UNLOCK(file_inode_lock);
+
 		perror("Not a file");
 
 		return -EISDIR;
 	}
 
 	if (finode.valid == 0) {
+		UNLOCK(file_inode_lock);
+
 		perror("File is not valid");
 
 		return -ENOENT;
@@ -2614,13 +2754,17 @@ static int myfs_write(const char* path, const char* buffer, size_t size, off_t o
 	int res = 0;
 
 	if ((res = file_write(&finode, buffer, size, (fi->flags & O_APPEND != 0) ? finode.size : offset)) < 0) {
+		UNLOCK(file_inode_lock);
+
 		return res;
 	}
+
+	UNLOCK(file_inode_lock);
 
 	printf("\tByte written: %zu\n", res);
 
 	printf("[myfs_write] Done.\n\n");
-
+	
 	return res;
 }
 
@@ -2638,6 +2782,12 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	assert(ROOT_INO != -1);
 
 	printf("[myfs_rename] source path: %s | target path : %s | flags = %u\n", source_path, target_path, flag);
+
+	pthread_rwlock_t 
+		*source_parent_ilock = NULL, 
+		*target_parent_ilock = NULL, 
+		*source_inode_ilock = NULL, 
+		*target_inode_ilock = NULL;
 
 	struct path_split source_p = { 0 };
 	struct path_split target_p = { 0 };
@@ -2673,10 +2823,18 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		return -ENOENT;
 	}
 
+	// Obtain lock on working inodes
+	source_parent_ilock = get_inode_lock(source_parent.ino);
+
+	// Since the parent inodes will be updated, using write lock
+	WR_LOCK(source_parent_ilock, "rename");
+
 	// Check if parent is a valid directory
 	if (!IS_DIR(source_parent)) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
+
+		UNLOCK(source_parent_ilock);
 
 		return -ENOTDIR;
 	}
@@ -2687,13 +2845,26 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		free_split_path(&source_p);
 		free_split_path(&target_p);
 
+		UNLOCK(source_parent_ilock);
+
 		return -ENOENT;
+	}
+
+	// In case of two parents are the same (mv in the same directory)
+	// Having another on target parent will introduce deadlock
+	if (target_parent.ino != source_parent.ino) {
+		target_parent_ilock = get_inode_lock(target_parent.ino);
+
+		WR_LOCK(target_parent_ilock, "rename");	
 	}
 
 	// Check if the target parent is a valid directory
 	if (!IS_DIR(target_parent)) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
+
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
 
 		return -ENOTDIR;
 	}
@@ -2706,16 +2877,24 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	gid_t gid = ctx->gid;
 
 	// Check permissions
+	// Since we want to write into source parent inode, thus we need write and execute permissions
 	if (!check_permissions(&source_parent, P_WX) && !IS_ROOT(uid)) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
 
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+
 		return -EACCES;
 	}
 
+	// Same as target parent inode
 	if (!check_permissions(&target_parent, P_WX) && !IS_ROOT(uid)) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
+
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
 
 		return -EACCES;
 	}
@@ -2728,6 +2907,9 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	if ((res = dir_find(source_parent.ino, source_base, strlen(source_base), &source_entry)) < 0) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
+
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
 	
 		return res;
 	}
@@ -2739,8 +2921,15 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		free_split_path(&source_p);
 		free_split_path(&target_p);
 
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+
 		return res;
 	}
+
+	source_inode_ilock = get_inode_lock(source_inode.ino);
+
+	WR_LOCK(source_inode_ilock, "rename");
 
 	// Check for sticky behavior
 	if (IS_DIR_STICKY(source_parent)) {
@@ -2751,6 +2940,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		) {
 			free_split_path(&source_p);
 			free_split_path(&target_p);
+
+
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
 
 			return -EPERM;
 		}
@@ -2768,6 +2962,10 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+
 			return res;
 		}
 
@@ -2777,9 +2975,18 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	}
 
 	if (target_exist) {
+		target_inode_ilock = get_inode_lock(target_inode.ino);
+
+		WR_LOCK(target_inode_ilock, "rename");
+
 		if ((res = read_inode(target_entry.ino, &target_inode)) < 0) {
 			free_split_path(&source_p);
 			free_split_path(&target_p);
+
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 	
 			return res;
 		}
@@ -2795,6 +3002,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 				free_split_path(&source_p);
 				free_split_path(&target_p);
 	
+				UNLOCK(source_parent_ilock);
+				if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+				UNLOCK(source_inode_ilock);
+				if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 				return -EPERM;
 			}
 		}
@@ -2805,6 +3017,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 			return -ENOTDIR;
 		}
 
@@ -2812,15 +3029,23 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 			return -EISDIR;
 		}
 
 		// Since we want to replace entry and if that entry is a dir, the target directory must be empty
 		if (IS_DIR(target_inode) && dir_entry_count(&target_inode) > 2) {
-			printf("\tRRENAME COUNT: %d\n", dir_entry_count(&target_inode));
-
 			free_split_path(&source_p);
 			free_split_path(&target_p);
+
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 
 			return -ENOTEMPTY;
 		}
@@ -2839,6 +3064,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 				free_split_path(&source_p);
 				free_split_path(&target_p);
 
+				UNLOCK(source_parent_ilock);
+				if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+				UNLOCK(source_inode_ilock);
+				if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 				return -EINVAL;
 			}
 		}
@@ -2853,11 +3083,16 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 			return -EACCES;
 		}
 	}
 
-	// All good to perform rename
+	// All checks are good, perform rename
 	if (target_exist) {
 		assert(target_inode.ino != 0);
 
@@ -2865,6 +3100,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		if ((res = dir_remove(&target_parent, &target_inode, target_base)) < 0) {
 			free_split_path(&source_p);
 			free_split_path(&target_p);
+
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 
 			return res;
 		}
@@ -2876,6 +3116,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 			return -EIO;
 		}
 
@@ -2884,6 +3129,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			if ((res = free_inode(target_inode.ino)) < 0) {
 				free_split_path(&source_p);
 				free_split_path(&target_p);
+
+				UNLOCK(source_parent_ilock);
+				if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+				UNLOCK(source_inode_ilock);
+				if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 
 				return res;
 			}
@@ -2897,6 +3147,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 		free_split_path(&source_p);
 		free_split_path(&target_p);
 
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+		UNLOCK(source_inode_ilock);
+		if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 		return res;
 	}
 
@@ -2906,6 +3161,11 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 	if ((res = dir_add(&target_parent, source_inode.ino, target_base, strlen(target_base))) < 0) {
 		free_split_path(&source_p);
 		free_split_path(&target_p);
+
+		UNLOCK(source_parent_ilock);
+		if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+		UNLOCK(source_inode_ilock);
+		if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 
 		return res;
 	}
@@ -2917,12 +3177,22 @@ static int myfs_rename(const char* source_path, const char* target_path, unsigne
 			free_split_path(&source_p);
 			free_split_path(&target_p);
 
+			UNLOCK(source_parent_ilock);
+			if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+			UNLOCK(source_inode_ilock);
+			if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
+
 			return res;
 		}
 	}
 
 	free_split_path(&source_p);
 	free_split_path(&target_p);
+
+	UNLOCK(source_parent_ilock);
+	if (target_parent_ilock != NULL) UNLOCK(target_parent_ilock);
+	UNLOCK(source_inode_ilock);
+	if (target_inode_ilock != NULL) UNLOCK(target_inode_ilock);
 
 	return 0;
 }
@@ -2939,6 +3209,8 @@ static int myfs_rmdir(const char* path) {
 		return -EBUSY;
 	}
 
+	pthread_rwlock_t* dir_inode_lock, *parent_inode_lock;
+
 	struct inode dir_inode = { 0 };
 
 	int node_res;
@@ -2947,14 +3219,22 @@ static int myfs_rmdir(const char* path) {
 		return node_res;
 	}
 
+	dir_inode_lock = get_inode_lock(dir_inode.ino);
+
+	WR_LOCK(dir_inode_lock, "rmdir");
+
 	// Check if this is a directory
 	if (dir_inode.type != S_IFDIR) {
+		UNLOCK(dir_inode_lock);
+
 		return -ENOTDIR;
 	}
 
 	// Can only delete empty dir
 	// Check if dir is empty
 	if (dir_entry_count(&dir_inode) > 2) {
+		UNLOCK(dir_inode_lock);
+
 		return -ENOTEMPTY;
 	}
 
@@ -2962,7 +3242,11 @@ static int myfs_rmdir(const char* path) {
 
 	struct path_split p = { 0 };
 
-	if (split_path(path, &p) < 0) return -ENOMEM;
+	if (split_path(path, &p) < 0) {
+		UNLOCK(dir_inode_lock);
+
+		return -ENOMEM;
+	}
 
 	char* base = p.base;
 	char* dir = p.dir;
@@ -2972,10 +3256,16 @@ static int myfs_rmdir(const char* path) {
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
 		perror("Cannot read inode");
 
+		UNLOCK(dir_inode_lock);
+
 		free_split_path(&p);
 
 		return -ENOENT;
 	}
+
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "rmdir");
 
 	printf("\tParent inode: %d\n", parent_inode.ino);
 
@@ -2984,10 +3274,13 @@ static int myfs_rmdir(const char* path) {
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	mode_t perm = get_perm_by_inode(&parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		free_split_path(&p);
+
+		UNLOCK(dir_inode_lock);
+		UNLOCK(parent_inode_lock);
 
 		return -EACCES;
 	}
@@ -2997,6 +3290,9 @@ static int myfs_rmdir(const char* path) {
 	if (parent_inode.mode & S_ISVTX) {
 		if (ctx->uid != parent_inode.uid && ctx->uid != dir_inode.uid && ctx->uid != 0) {
 			free_split_path(&p);
+
+			UNLOCK(dir_inode_lock);
+			UNLOCK(parent_inode_lock);
 
 			return -EPERM;
 		}
@@ -3008,6 +3304,9 @@ static int myfs_rmdir(const char* path) {
 
 		free_split_path(&p);
 
+		UNLOCK(dir_inode_lock);
+		UNLOCK(parent_inode_lock);
+
 		return -EIO;
 	}
 
@@ -3015,6 +3314,9 @@ static int myfs_rmdir(const char* path) {
 	parent_inode.nlink--;
 
 	if (write_inode(parent_inode.ino, &parent_inode) < 0) {
+		UNLOCK(dir_inode_lock);
+		UNLOCK(parent_inode_lock);
+
 		return -EIO;
 	}
 
@@ -3022,8 +3324,14 @@ static int myfs_rmdir(const char* path) {
 
 	// reset data block if it has any allocated data blocks
 	if (reset_ino(dir_inode.ino) < 0) {
+		UNLOCK(dir_inode_lock);
+		UNLOCK(parent_inode_lock);
+
 		return -EIO;
 	}
+
+	UNLOCK(dir_inode_lock);
+	UNLOCK(parent_inode_lock);
 
 	printf("[myfs_rmdir] Done.\n\n");
 
@@ -3047,7 +3355,13 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 
 	assert(fh != NULL);
 
+	pthread_rwlock_t* finode_lock = get_inode_lock(fh->ino);
+
+	WR_LOCK(finode_lock, "releasedir");
+
 	if (read_inode(fh->ino, &finode) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot read inode");
 
 		return -ENOENT;
@@ -3059,6 +3373,8 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 	finode.open_count--;
 
 	if (write_inode(finode.ino, &finode) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
@@ -3067,6 +3383,8 @@ static int myfs_releasedir(const char* path, struct fuse_file_info *fi) {
 	fi->fh = 0;
 
 	free((void*)fi->fh);
+
+	UNLOCK(finode_lock);
 
 	printf("[myfs_releasedir] Done.\n\n");
 
@@ -3085,6 +3403,8 @@ static int myfs_unlink(const char* path) {
 		return -EBUSY;
 	}
 
+	pthread_rwlock_t* finode_lock, *parent_inode_lock;
+
 	struct inode f_inode = { 0 };
 
 	int node_res;
@@ -3093,8 +3413,14 @@ static int myfs_unlink(const char* path) {
 		return node_res;
 	}
 
+	finode_lock = get_inode_lock(f_inode.ino);
+
+	WR_LOCK(finode_lock, "unlink");
+
 	// Check if this is a file or a softlink
 	if (f_inode.type == S_IFDIR) {
+		UNLOCK(finode_lock);
+
 		return -EPERM;
 	}
 
@@ -3102,7 +3428,11 @@ static int myfs_unlink(const char* path) {
 
 	struct path_split p = { 0 };
 
-	if (split_path(path, &p) < 0) return -ENOMEM;
+	if (split_path(path, &p) < 0) {
+		UNLOCK(finode_lock);
+
+		return -ENOMEM;
+	}
 
 	char* base = p.base;
 	char* dir = p.dir;
@@ -3114,8 +3444,14 @@ static int myfs_unlink(const char* path) {
 
 		free_split_path(&p);
 
+		UNLOCK(finode_lock);
+
 		return -ENOENT;
 	}
+
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "unlink");
 
 	printf("\tParent inode: %d\n", parent_inode.ino);
 
@@ -3123,16 +3459,26 @@ static int myfs_unlink(const char* path) {
 	// In case the parent inode has sticky bit presents, then user must own the file or own the directory or be root user
 	struct fuse_context* ctx = fuse_get_context();
 	
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	mode_t perm = get_perm_by_inode(&parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		printf("\tDir does not have write permission - Perm: %05o | Owner is: %d | User is: %d\n", parent_inode.mode, parent_inode.uid, ctx->uid);
+
+		free_split_path(&p);
+
+		UNLOCK(finode_lock);
+		UNLOCK(parent_inode_lock);
 
 		return -EACCES;
 	}
 
 	if (STICKY_MODE(parent_inode.mode)) {
 		if (ctx->uid != f_inode.uid && ctx->uid != parent_inode.uid && ctx->uid != 0) {
+			free_split_path(&p);
+
+			UNLOCK(finode_lock);
+			UNLOCK(parent_inode_lock);
+
 			return -EPERM;
 		}
 	}
@@ -3143,6 +3489,9 @@ static int myfs_unlink(const char* path) {
 
 		free_split_path(&p);
 
+		UNLOCK(finode_lock);
+		UNLOCK(parent_inode_lock);
+
 		return -EIO;
 	}
 
@@ -3151,6 +3500,9 @@ static int myfs_unlink(const char* path) {
 
 	if (write_inode(f_inode.ino, &f_inode) < 0) {
 		free_split_path(&p);
+
+		UNLOCK(finode_lock);
+		UNLOCK(parent_inode_lock);
 		
 		return -EIO;
 	}
@@ -3172,6 +3524,9 @@ static int myfs_unlink(const char* path) {
 
 					perror("Cannot reset data block");
 
+					UNLOCK(finode_lock);
+					UNLOCK(parent_inode_lock);
+
 					return -EIO;
 				}
 			}
@@ -3184,6 +3539,9 @@ static int myfs_unlink(const char* path) {
 			int num_blk = BLOCK_SIZE / sizeof(int);
 
 			if (buf == NULL) {
+				UNLOCK(finode_lock);
+				UNLOCK(parent_inode_lock);
+
 				return -ENOSPC;
 			}
 
@@ -3191,6 +3549,9 @@ static int myfs_unlink(const char* path) {
 				printf("\tblock_read\n");
 
 				perror("Cannot read block");
+
+				UNLOCK(finode_lock);
+				UNLOCK(parent_inode_lock);
 
 				return -EIO;
 			}
@@ -3202,6 +3563,9 @@ static int myfs_unlink(const char* path) {
 					printf("\treset_data_block_2\n");
 
 					perror("Cannot reset data block");
+
+					UNLOCK(finode_lock);
+					UNLOCK(parent_inode_lock);
 
 					return -EIO;
 				}
@@ -3216,9 +3580,15 @@ static int myfs_unlink(const char* path) {
 
 			perror("Cannot reset inode");
 
+			UNLOCK(finode_lock);
+			UNLOCK(parent_inode_lock);
+
 			return -EIO;
 		}
 	}
+
+	UNLOCK(finode_lock);
+	UNLOCK(parent_inode_lock);
 
 	printf("[myfs_unlink] Done.\n\n");
 
@@ -3232,6 +3602,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 	
 	printf("[myfs_truncate] path: %s | size: %ld\n", path, size);
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode f_inode = { 0 };
 
 	struct file_handler* fh = NULL;
@@ -3241,7 +3613,13 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 		printf("\tFH ino: %ld\n", fh->ino);
 
+		finode_lock = get_inode_lock(fh->ino);
+
+		WR_LOCK(finode_lock, "truncate");
+
 		if (read_inode(fh->ino, &f_inode) == -1) {
+			UNLOCK(finode_lock);
+
 			return -ENOENT;
 		}
 	} else {
@@ -3250,6 +3628,10 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		if ((node_res = get_node_by_path(path, ROOT_INO, &f_inode)) < 0) {
 			return node_res;
 		}
+
+		finode_lock = get_inode_lock(fh->ino);
+
+		WR_LOCK(finode_lock, "truncate");
 	}
 
 	// If file is opened
@@ -3261,6 +3643,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		printf("\tCan write if opened: %d\n", can_write);
 
 		if (!can_write) {
+			UNLOCK(finode_lock);
+
 			return -EACCES;
 		}
 	} else {
@@ -3272,20 +3656,28 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		gid_t gid = ctx->gid;
 
 		// Check if it has write permission
-		mode_t perm = get_perm_by_inode(uid, gid, &f_inode);
+		mode_t perm = get_perm_by_inode(&f_inode);
 
 		if (!PERM_CAN_WRITE(perm) && uid != 0) {
+			UNLOCK(finode_lock);
+
 			return -EACCES;
 		}
 	}
 
 	if (f_inode.type == S_IFDIR) {
+		UNLOCK(finode_lock);
+
 		return -EISDIR;
 	}
 
 	uint32_t MAX_SIZE = DIRECT_PTRS_COUNT * BLOCK_SIZE + (BLOCK_SIZE / sizeof(int)) * BLOCK_SIZE;
 
-	if (size >= MAX_SIZE) return -EFBIG;
+	if (size >= MAX_SIZE) {
+		UNLOCK(finode_lock);
+
+		return -EFBIG;
+	}
 
 	if (f_inode.size == size) {
 		printf("\tFile size equals to requested size. Do nothing\n");
@@ -3294,12 +3686,16 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		f_inode.atime = now();
 
 		if (write_inode(f_inode.ino, &f_inode) == -1) {
+			UNLOCK(finode_lock);
+
 			perror("Cannot write inode");
 
 			return -EIO;
 		}
 
 		printf("[myfs_truncate] Done.\n\n");
+
+		UNLOCK(finode_lock);
 
 		return 0;
 	}
@@ -3316,8 +3712,12 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		if (write_inode(f_inode.ino, &f_inode) < 0) {
 			perror("Cannot write inode");
 
+			UNLOCK(finode_lock);
+
 			return -EIO;
 		}
+
+		UNLOCK(finode_lock);
 
 		printf("[myfs_truncate] Done.\n\n");
 
@@ -3345,6 +3745,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 			if (f_inode.directs[blk] < 0) continue;
 
 			if (reset_data_block(f_inode.directs[blk]) < 0) {
+				UNLOCK(finode_lock);
+
 				return -EIO;
 			}
 		} else {
@@ -3360,11 +3762,15 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 				indirect_buf = (int*)malloc(BLOCK_SIZE);
 
 				if (indirect_buf == NULL) {
+					UNLOCK(finode_lock);
+
 					return -ENOSPC;
 				}
 			}
 
 			if (block_read(f_inode.indirect_ptr, indirect_buf) < 0) {
+				UNLOCK(finode_lock);
+
 				return -EIO;
 			}
 
@@ -3372,6 +3778,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 			if (reset_data_block(indirect_buf[blk_off]) < 0) {
 				free(indirect_buf);
+
+				UNLOCK(finode_lock);
 
 				return -EIO;
 			}
@@ -3387,12 +3795,16 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 		void* buffer = malloc(BLOCK_SIZE);
 
 		if (buffer == NULL) {
+			UNLOCK(finode_lock);
+
 			perror("Cannot allocate memory");
 
 			return -ENOSPC;
 		}
 
 		if (block_read(f_inode.directs[start_removed_blk_idx - 1], buffer) < 0) {
+			UNLOCK(finode_lock);
+
 			perror("Cannot read block");
 
 			free(buffer);
@@ -3406,6 +3818,8 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 
 		if (block_write(f_inode.directs[start_removed_blk_idx - 1], buffer) < 0) {
 			perror("Cannot write block");
+
+			UNLOCK(finode_lock);
 
 			free(buffer);
 
@@ -3423,10 +3837,14 @@ static int myfs_truncate(const char *path, off_t size, struct fuse_file_info *fi
 	f_inode.mtime = now();
 
 	if (write_inode(f_inode.ino, &f_inode) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
 	}
+
+	UNLOCK(finode_lock);
 
 	printf("\tUpdated f_inode size = %u\n", f_inode.size);
 
@@ -3443,6 +3861,8 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 	assert(path != NULL);
 	assert(ROOT_INO != -1);
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode item = { 0 };
 
 	struct file_handler* fh = NULL;
@@ -3452,23 +3872,37 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 
 		assert(fh != NULL);
 
+		finode_lock = get_inode_lock(fh->ino);
+
+		WR_LOCK(finode_lock, "truncate");
+
 		if (read_inode(fh->ino, &item) < 0) {
+			UNLOCK(finode_lock);
+
 			return -ENOENT;
 		}
 	} else {
 		int node_res;
 
 		if ((node_res = get_node_by_path(path, ROOT_INO, &item)) < 0) {
+			
 			return node_res;
 		}
+
+		finode_lock = get_inode_lock(item.ino);
+
+		WR_LOCK(finode_lock, "utimens");
 	}
 
 	struct fuse_context* ctx = fuse_get_context();
 
 	assert(ctx != NULL);
 
+	uid_t uid = ctx->uid;
+	gid_t gid = ctx->gid;
+
 	bool can_write = false;
-	bool owner_or_root = (ctx->uid == item.uid) || ctx->uid == 0;
+	bool owner_or_root = (uid == item.uid) || IS_ROOT(uid);
 	
 	if (fh != NULL) {
 		int access_mode = fh->flags & O_ACCMODE;
@@ -3476,7 +3910,7 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 		
 		printf("\tPermissions from fh : can_write: %d\n", can_write);
 	} else {
-		mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &item);
+		mode_t perm = get_perm_by_inode(&item);
 
 		can_write = PERM_CAN_WRITE(perm);
 
@@ -3490,7 +3924,11 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 	// If times is NULL or both times are NOW
 	// allowed if owner or root
 	if (tv == NULL) {
-		if (!owner_or_root && !can_write) return -EACCES;
+		if (!owner_or_root && !can_write) {
+			UNLOCK(finode_lock);
+
+			return -EACCES;
+		}
 
 		item.atime = now;
 		item.mtime = now;
@@ -3504,12 +3942,20 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 		}
 
 		if (!explicit_present) {
-			if (!owner_or_root && !can_write) return -EACCES;
+			if (!owner_or_root && !can_write) {
+				UNLOCK(finode_lock);
+
+				return -EACCES;
+			}
 
 			if (tv[0].tv_nsec == UTIME_NOW) item.atime = now;
 			if (tv[1].tv_nsec == UTIME_NOW) item.mtime = now;
 		} else {
-			if (!owner_or_root) return -EPERM;
+			if (!owner_or_root) {
+				UNLOCK(finode_lock);
+
+				return -EPERM;
+			}
 
 			// Update atime
 			if (tv[0].tv_nsec == UTIME_NOW) {
@@ -3528,10 +3974,14 @@ static int myfs_utimens(const char* path, const struct timespec tv[2], struct fu
 	}
 
 	if (write_inode(item.ino, &item) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
 	}
+
+	UNLOCK(finode_lock);
 
 	return 0;
 }
@@ -3555,7 +4005,13 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 
 	printf("\tFH ino: %ld\n", fh->ino);
 
+	pthread_rwlock_t* finode_lock = get_inode_lock(fh->ino);
+
+	WR_LOCK(finode_lock, "release");
+
 	if (read_inode(fh->ino, &finode) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot read inode");
 
 		return -ENOENT;
@@ -3567,6 +4023,8 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 	finode.open_count--;
 
 	if (write_inode(finode.ino, &finode) < 0) {
+		UNLOCK(finode_lock);
+
 		perror("Cannot write inode");
 
 		return -EIO;
@@ -3575,6 +4033,8 @@ static int myfs_release(const char* path, struct fuse_file_info *fi) {
 	free((void*)fi->fh);
 
 	fi->fh = 0;
+
+	UNLOCK(finode_lock);
 
 	printf("[myfs_release] Done.\n\n");
 
@@ -3587,6 +4047,8 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 
 	printf("[myfs_fallocate] path: %s | mode = %d | offset: %lu | len: %lu\n", path, mode, offset, len);
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode finode = { 0 }; 
 
 	struct file_handler* fh = NULL;
@@ -3598,7 +4060,13 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 
 		printf("\tFH ino: %ld\n", fh->ino);
 
+		finode_lock = get_inode_lock(fh->ino);
+
+		WR_LOCK(finode_lock, "fallocate");
+
 		if (read_inode(fh->ino, &finode) < 0) {
+			UNLOCK(finode_lock);
+
 			perror("Cannot read inode");
 	
 			return -ENOENT;
@@ -3609,43 +4077,126 @@ static int myfs_fallocate(const char* path, int mode, off_t offset, off_t len, s
 		if ((node_res = get_node_by_path(path, ROOT_INO, &finode)) < 0) {
 			return node_res;
 		}
+
+		finode_lock = get_inode_lock(finode.ino);
+
+		WR_LOCK(finode_lock, "fallocate");
 	}
 
 	int start_blk_idx = offset / BLOCK_SIZE;
 	int end_blk_idx = (offset + len) / BLOCK_SIZE;
+	int blk, offset_indirect, num_blks_indirect = BLOCK_SIZE / sizeof(int);
 
 	// Assume data size is only in DIRECT
 	assert(start_blk_idx < DIRECT_PTRS_COUNT);
 	assert(end_blk_idx < DIRECT_PTRS_COUNT);
 
+	int* indirect_buffer = NULL;
+
 	for (int i = start_blk_idx; i <= end_blk_idx; ++i) {
-		if (finode.directs[i] >= 0) {
-			printf("\tIno: %ld | blk idx: %d | block: %d has been allocated before\n", finode.ino, i, finode.directs[i]);
+		if (i < DIRECT_PTRS_COUNT) {
+			printf("\tAssigning data block in DIRECT region of ino: %ld\n", finode.ino);
 
-			// Already assigned
-			continue;
+			// Region in DIRECT
+			if (finode.directs[i] >= 0) {
+				printf("\tIno: %ld | blk idx: %d | block: %d has been allocated before\n", finode.ino, i, finode.directs[i]);
+	
+				// Already assigned
+				continue;
+			}
+
+			// Assign data block
+			blk = get_avail_blkno();
+
+			if (blk < 0) {
+				UNLOCK(finode_lock);
+
+				perror("Cannot allocate memory");
+
+				return -ENOSPC;
+			}
+
+			finode.directs[i] = blk;
+
+			printf("\tIno: %ld | blk idx: %d | block: %d has been assigned\n", finode.ino, i, blk);
+		} else {
+			offset_indirect = i - DIRECT_PTRS_COUNT;
+
+			assert(offset_indirect >= 0 && offset_indirect < num_blks_indirect);
+
+			if (finode.indirect_ptr < 0) {
+				// Allocate block for indirect pointer
+				int blk = get_avail_blkno();
+
+				if (blk < 0) {
+					UNLOCK(finode_lock);
+
+					return -ENOSPC;
+				}
+
+				finode.indirect_ptr = blk;
+			}
+
+			if (indirect_buffer == NULL) {
+				// Read data block of indirect ptr
+				indirect_buffer = (int*)malloc(BLOCK_SIZE);
+
+				if (indirect_buffer == NULL) {
+					UNLOCK(finode_lock);
+
+					return -ENOMEM;
+				}
+
+				if (block_read(finode.indirect_ptr, indirect_buffer) < 0) {
+					free(indirect_buffer);
+
+					UNLOCK(finode_lock);
+
+					return -EIO;
+				}
+			}
+
+			// Check if data block has been assigned before
+			if (indirect_buffer[offset_indirect] <= 0) {
+				// Not yet assigned
+				blk = get_avail_blkno();
+
+				if (blk < 0) {
+					free(indirect_buffer);
+
+					UNLOCK(finode_lock);
+
+					return -ENOSPC;
+				}
+
+				indirect_buffer[offset_indirect] = blk;
+			}
 		}
+	}
 
-		// Assign data block
-		int blk = get_avail_blkno();
+	if (indirect_buffer != NULL) {
+		// Data is written into indirect, save change
+		assert(finode.indirect_ptr > 0);
 
-		if (blk < 0) {
-			perror("Cannot allocate memory");
+		if (block_write(finode.indirect_ptr, indirect_buffer) < 0) {
+			free(indirect_buffer);
 
-			return -ENOSPC;
+			UNLOCK(finode_lock);
+
+			return -EIO;
 		}
-
-		finode.directs[i] = blk;
-
-		printf("\tIno: %ld | blk idx: %d | block: %d has been assigned\n", finode.ino, i, blk);
 	}
 
 	// Save changes in inode
 	if (write_inode(finode.ino, &finode) < 0) {
 		perror("Cannot write inode");
 
+		UNLOCK(finode_lock);
+
 		return -EIO;
 	}
+
+	UNLOCK(finode_lock);
 
 	printf("[myfs_fallocate] Done.\n\n");
 
@@ -3662,7 +4213,7 @@ static ssize_t myfs_copy_file_range(
 	size_t size, 
 	int flags
 ) {
-	return 0;
+	return -EOPNOTSUPP;
 }
 
 static int myfs_flock(const char* path, struct fuse_file_info *fi, int op) {
@@ -3678,33 +4229,18 @@ static int myfs_symlink(const char* target, const char* link) {
 	
 	printf("\tCreating symlink file\n");
 
-	char *tmp1, *tmp2;
+	struct path_split ps = { 0 };
 
-	tmp1 = strdup(link);
-	tmp2 = strdup(link);
-
-	if (tmp1 == NULL || tmp2 == NULL) {
-		perror("Cannot allocate memory");
-
-		if (tmp1) free(tmp1);
-		if (tmp2) free(tmp2);
-
-		return -ENOSPC;
+	if (split_path(link, &ps) < 0) {
+		return -ENOMEM;
 	}
 
-	char *base = basename(tmp1);
-	char *dir = dirname(tmp2);
-
-	// if (base == NULL || dir == NULL) {
-	// 	perror("Cannot allocate memory");
-
-	// 	if (base) free(base);
-	// 	if (dir) free(dir);
-
-	// 	return -ENOSPC;
-	// }
+	char *base = ps.base;
+	char *dir = ps.dir;
 
 	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
+
+	pthread_rwlock_t* parent_inode_lock, *file_inode_lock;
 
 	// Get parent inode and check if the target file is already exist
 	struct inode parent_inode = { 0 };
@@ -3712,23 +4248,28 @@ static int myfs_symlink(const char* target, const char* link) {
 	int node_res;
 
 	if ((node_res = get_node_by_path(dir, ROOT_INO, &parent_inode)) < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
 		
 		return node_res;
 	}
 
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "symlink");
+
 	if (parent_inode.valid == 0) {
-		free(tmp1);
-		free(tmp2);
+		UNLOCK(parent_inode_lock);
+
+		free_split_path(&ps);
 
 		return -ENOENT;
 	}
 
 	// Check if the target file already exists
 	if (dir_find(parent_inode.ino, base, strlen(base), NULL) == 0) {
-		free(tmp1);
-		free(tmp2);
+		UNLOCK(parent_inode_lock);
+
+		free_split_path(&ps);
 
 		return -EEXIST;
 	}
@@ -3737,19 +4278,29 @@ static int myfs_symlink(const char* target, const char* link) {
 	int ino = get_avail_ino();
 
 	if (ino < 0) {
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
 
 		return -ENOSPC;
 	}
+
+	file_inode_lock = get_inode_lock(ino);
+
+	WR_LOCK(file_inode_lock, "symlink");
 
 	struct fuse_context* ctx = fuse_get_context();
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	uid_t uid = ctx->uid;
 
-	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
+	mode_t perm = get_perm_by_inode(&parent_inode);
+
+	if (!PERM_CAN_WRITE(perm) && !IS_ROOT(uid)) {
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -EACCES;
 	}
 
@@ -3758,8 +4309,10 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (write_inode(ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
 
 		return -EIO;
 	}
@@ -3769,8 +4322,10 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (dir_add(&parent_inode, ino, base, strlen(base)) < 0) {
 		perror("Cannot add dirent entry");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
 
 		return -EIO;
 	}
@@ -3787,12 +4342,22 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (buffer_size > BLOCK_SIZE) {
 		perror("Path cannot longer than a page");
 
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -ENOSPC;
 	}
 
 	int blk_idx = get_avail_blkno();
 
 	if (blk_idx < 0) {
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
+
 		return -ENOSPC;
 	}
 
@@ -3804,8 +4369,10 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (write_inode(new_file_inode.ino, &new_file_inode) < 0) {
 		perror("Cannot write inode");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
 
 		return -EIO;
 	}
@@ -3816,8 +4383,10 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (buffer == NULL) {
 		perror("Cannot allocate memory");
 
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
 
 		return -ENOSPC;
 	}
@@ -3827,18 +4396,24 @@ static int myfs_symlink(const char* target, const char* link) {
 	if (block_write(blk_idx, buffer) < 0) {
 		perror("Cannot write block");
 		
-		free(tmp1);
-		free(tmp2);
+		free_split_path(&ps);
+
 		free(buffer);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(file_inode_lock);
 
 		return -EIO;
 	}
 
 	printf("\tWrote path to file\n");
 
-	free(tmp1);
-	free(tmp2);
+	free_split_path(&ps);
+
 	free(buffer);
+
+	UNLOCK(parent_inode_lock);
+	UNLOCK(file_inode_lock);
 
 	printf("[myfs_symlink] Done.\n\n");
 
@@ -3862,6 +4437,8 @@ static int myfs_link(const char* target, const char* link) {
 
 	printf("\tLink -- Dir: %s | Base: %s\n", dir, base);
 
+	pthread_rwlock_t* parent_inode_lock, *target_inode_lock;
+
 	struct inode parent_inode = { 0 };
 
 	int node_res;
@@ -3872,8 +4449,14 @@ static int myfs_link(const char* target, const char* link) {
 		return node_res;
 	}
 
+	parent_inode_lock = get_inode_lock(parent_inode.ino);
+
+	WR_LOCK(parent_inode_lock, "link");
+
 	if (parent_inode.valid == 0) {
 		free_split_path(&link_path);
+
+		UNLOCK(parent_inode_lock);
 
 		return -ENOENT;
 	}
@@ -3883,10 +4466,12 @@ static int myfs_link(const char* target, const char* link) {
 
 	assert(ctx != NULL);
 
-	mode_t perm = get_perm_by_inode(ctx->uid, ctx->gid, &parent_inode);
+	mode_t perm = get_perm_by_inode(&parent_inode);
 
 	if (!PERM_CAN_WRITE(perm) && ctx->uid != 0) {
 		free_split_path(&link_path);
+
+		UNLOCK(parent_inode_lock);
 
 		return -EACCES;
 	}
@@ -3896,8 +4481,14 @@ static int myfs_link(const char* target, const char* link) {
 	if ((node_res = get_node_by_path(target, ROOT_INO, &target_inode)) < 0) {
 		free_split_path(&link_path);
 
+		UNLOCK(parent_inode_lock);
+
 		return node_res;
 	}
+
+	target_inode_lock = get_inode_lock(target_inode.ino);
+
+	WR_LOCK(target_inode_lock, "link");
 
 	printf("\tTarget ino for hard link is: %ld\n", target_inode.ino);
 
@@ -3905,6 +4496,9 @@ static int myfs_link(const char* target, const char* link) {
 		perror("Cannot add entry to directory");
 
 		free_split_path(&link_path);
+
+		UNLOCK(parent_inode_lock);
+		UNLOCK(target_inode_lock);
 
 		return -EIO;
 	}
@@ -3915,10 +4509,16 @@ static int myfs_link(const char* target, const char* link) {
 	if (write_inode(target_inode.ino, &target_inode) < 0) {
 		free_split_path(&link_path);
 		
+		UNLOCK(parent_inode_lock);
+		UNLOCK(target_inode_lock);
+		
 		return -EIO;
 	}
 
 	free_split_path(&link_path);
+
+	UNLOCK(parent_inode_lock);
+	UNLOCK(target_inode_lock);
 
 	printf("[myfs_link] Done.\n\n");
 
@@ -3932,6 +4532,8 @@ static int myfs_readlink(const char* link, char* buffer, size_t len) {
 
 	printf("[myfs_readlink] link: %s | len: %zu\n", link, len);
 
+	pthread_rwlock_t* link_inode_lock;
+
 	struct inode link_inode = { 0 };
 
 	int node_res;
@@ -3940,19 +4542,29 @@ static int myfs_readlink(const char* link, char* buffer, size_t len) {
 		return node_res;
 	}
 
+	link_inode_lock = get_inode_lock(link_inode.ino);
+
+	RD_LOCK(link_inode_lock, "readlink");
+
 	if (!S_ISLNK(link_inode.mode)) {
+		UNLOCK(link_inode_lock);
+
 		return -EINVAL;
 	}
 
 	// Should return a flag
 	// assert(link_inode.directs[0] >= 0);
 	if (link_inode.directs[0] < 0) {
+		UNLOCK(link_inode_lock);
+
 		return - EIO;
 	}
 
 	char* blk_buffer = (char*)malloc(BLOCK_SIZE);
 
 	if (blk_buffer == NULL) {
+		UNLOCK(link_inode_lock);
+
 		perror("Cannot allocate memory");
 
 		return -ENOSPC;
@@ -3960,6 +4572,8 @@ static int myfs_readlink(const char* link, char* buffer, size_t len) {
 
 	if (block_read(link_inode.directs[0], blk_buffer) < 0) {
 		perror("Cannot read block");
+
+		UNLOCK(link_inode_lock);
 
 		free(blk_buffer);
 
@@ -3973,9 +4587,12 @@ static int myfs_readlink(const char* link, char* buffer, size_t len) {
 	size_t n = target_len < (len - 1) ? target_len : len - 1;
 
 	memcpy(buffer, blk_buffer, n);
+
 	buffer[n] = '\0';
 
 	free(blk_buffer);
+
+	UNLOCK(link_inode_lock);
 
 	printf("[myfs_readlink] Done.\n\n");
 
@@ -4004,6 +4621,8 @@ static int myfs_access(const char* path, int mode) {
 
 	printf("[myfs_access] path: %s\n", path);
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode item = { 0 };
 
 	int node_res;
@@ -4012,7 +4631,13 @@ static int myfs_access(const char* path, int mode) {
 		return -ENOENT;
 	}
 
+	finode_lock = get_inode_lock(item.ino);
+
+	RD_LOCK(finode_lock, "access");
+
 	if (item.valid == 0) {
+		UNLOCK(finode_lock);
+
 		return -ENOENT;
 	}
 
@@ -4021,6 +4646,9 @@ static int myfs_access(const char* path, int mode) {
 	if (mode == F_OK) {
 		// The user wants to know if the file exists
 		printf("\tRequest file exist granted\n");
+
+		UNLOCK(finode_lock);
+
 		return 0;
 	}
 
@@ -4052,21 +4680,32 @@ static int myfs_access(const char* path, int mode) {
 	{
 	case R_OK:
 		// Ther user who invokes this want to know if they can read this file
-		if (PERM_CAN_READ(mode)) return 0;
+		if (PERM_CAN_READ(mode)) {
+			UNLOCK(finode_lock);
+			return 0;
+		}
 
 		break;
 	case W_OK:
 		// The user who invokes this want to know if they can write this file
-		if (PERM_CAN_WRITE(perm)) return 0;
+		if (PERM_CAN_WRITE(perm)) {
+			UNLOCK(finode_lock);
+			return 0;
+		}
 
 		break;
 	case X_OK:
 		// The user who invokes this want to know if they can execute this file
-		if (PERM_CAN_EXECUTE(perm)) return 0;
+		if (PERM_CAN_EXECUTE(perm)) {
+			UNLOCK(finode_lock);
+			return 0;
+		}
 		break;
 	default:
 		break;
 	}
+
+	UNLOCK(finode_lock);
 
 	return -EACCES;
 }
@@ -4084,6 +4723,8 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	uid_t uid = ctx->uid;
 	uid_t gid = ctx->gid;
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode item = { 0 };
 
 	int node_res;
@@ -4091,6 +4732,10 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	if ((node_res = get_node_by_path(path, ROOT_INO, &item)) < 0) {
 		return node_res;
 	}
+
+	finode_lock = get_inode_lock(item.ino);
+
+	WR_LOCK(finode_lock, "chmod");
 
 	printf("\tIno: %ld | uid: %d | gid: %d\n", item.ino, uid, gid);
 
@@ -4121,18 +4766,34 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 		bool change_non_special = (changed & ~(S_ISUID | S_ISGID)) != 0;
 
 		// Non-owner can never add setuid
-		if (adding_suid) return -EPERM;
+		if (adding_suid) {
+			UNLOCK(finode_lock);
+
+			return -EPERM;
+		}
 
 		// Non-owner may add setgid if they belongs to the item's group id and no the bits are changed
 		if (adding_sgid) {
 			// Not belong to group
-			if (gid != item.gid) return -EPERM;
+			if (gid != item.gid) {
+				UNLOCK(finode_lock);
+	
+				return -EPERM;
+			}
 
 			// User change other bits, not allowed
-			if (change_non_special) return -EPERM;
+			if (change_non_special) {
+				UNLOCK(finode_lock);
+	
+				return -EPERM;
+			}
 		} else {
 			// Any other normal chmod by non-owner is not allowed
-			if (change_non_special) return -EPERM;
+			if (change_non_special) {
+				UNLOCK(finode_lock);
+	
+				return -EPERM;
+			}
 		}
 	}
 
@@ -4156,8 +4817,12 @@ static int myfs_chmod(const char* path, mode_t mode, struct fuse_file_info *fi) 
 	item.mode = (item.mode & S_IFMT) | req_perm;
 
 	if (write_inode(item.ino, &item) < 0) {
+		UNLOCK(finode_lock);
+
 		return -EIO;
 	}
+
+	UNLOCK(finode_lock);
 
 	printf("\tAfter perm change: %05o | req perm: %05o\n", item.mode & 07777, req_perm);
 
@@ -4171,6 +4836,8 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 	assert(ROOT_INO != -1);
 	
 	printf("[myfs_chown] path: %s | uid: %d | gid: %d\n", path, uid, gid);
+
+	pthread_rwlock_t* finode_lock;
 
 	struct fuse_context* ctx = fuse_get_context();
 	
@@ -4187,10 +4854,18 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 		return node_res;
 	}
 
+	finode_lock = get_inode_lock(item.ino);
+
+	WR_LOCK(finode_lock, "chown");
+
 	if (uid != (uid_t)-1 && uid != item.uid) {
 		// User wish to change uid
 		// Only root can change uid
-		if (!IS_ROOT(uuid)) return -EPERM;
+		if (!IS_ROOT(uuid)) {
+			UNLOCK(finode_lock);
+
+			return -EPERM;
+		}
 	}
 
 	if (gid != (gid_t)-1 && gid != item.gid) {
@@ -4204,6 +4879,8 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 		
 		if (!IS_ROOT(uuid)) {
 			if (uuid != item.uid || ggid != item.gid) {
+				UNLOCK(finode_lock);
+
 				return -EPERM;
 			}
 		}
@@ -4219,8 +4896,12 @@ static int myfs_chown(const char* path, uid_t uid, gid_t gid, struct fuse_file_i
 	}
 
 	if (write_inode(item.ino, &item) < 0) {
+		UNLOCK(finode_lock);
+
 		return -EIO;
 	}
+
+	UNLOCK(finode_lock);
 
 	printf("[myfs_chown] Done.\n\n");
 
@@ -4235,6 +4916,8 @@ static int myfs_statfs(const char* path, struct statvfs *stat) {
 
 	printf("[myfs_statfs] path: %s\n", path);
 
+	pthread_rwlock_t* finode_lock;
+
 	struct inode item = { 0 };
 
 	int node_res;
@@ -4243,12 +4926,18 @@ static int myfs_statfs(const char* path, struct statvfs *stat) {
 		return node_res;
 	}
 
+	finode_lock = get_inode_lock(item.ino);
+
+	RD_LOCK(finode_lock, "statfs");
+
 	stat->f_bsize = BLOCK_SIZE;
 	stat->f_frsize = BLOCK_SIZE;
 	stat->f_blocks = superblock->max_dnum;
 	stat->f_namemax = NAME_MAX;
 	stat->f_bfree = superblock->free_blk_count;
-	
+
+	UNLOCK(finode_lock);
+
 	return 0;
 }
 
@@ -4302,6 +4991,24 @@ static struct fuse_operations myfs_ope = {
 
 // Entry point of the library
 int main(int argc, char* argv[]) {
+	int fd = open("/home/myfs-thread.log", O_CREAT | O_WRONLY | O_TRUNC);
+
+	if (fd <= 0) {
+		perror("open");
+
+		exit(EXIT_FAILURE);
+	}
+
+	thread_log_fd = fdopen(fd, "w");
+
+	if (!thread_log_fd) {
+		perror("fdopen");
+		
+		close(fd);
+
+		exit(EXIT_FAILURE);
+	}
+
 	printf("Starting MYFS file system...\n");
 
 	int fuse_stat;
